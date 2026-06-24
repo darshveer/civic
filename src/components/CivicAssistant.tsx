@@ -229,7 +229,7 @@ export default function CivicAssistant({ currentUser }: CivicAssistantProps) {
               className="absolute right-2 p-2 bg-primary text-white rounded-full disabled:opacity-50 disabled:cursor-not-allowed hover:bg-primary/90 transition-colors"
             >
               {isLoading ? (
-                <Loader2 className="w-4 h-4 animate-spin" />
+                <img src="/civic-logo.svg" className="w-4 h-4 animate-pulse brightness-0 invert" alt="Loading" />
               ) : (
                 <Send className="w-4 h-4 ml-0.5" />
               )}

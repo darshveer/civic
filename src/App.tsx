@@ -4,7 +4,7 @@
  */
 
 import React, { useState, useEffect, Suspense, lazy } from "react";
-import { motion } from "motion/react";
+import { motion, AnimatePresence } from "motion/react";
 import {
   auth,
   db,
@@ -61,6 +61,8 @@ import {
   Moon,
   Sun,
   Bell,
+  Activity,
+  LayoutDashboard,
 } from "lucide-react";
 
 type TabType = "reporter" | "map" | "impact" | "staff-list" | "staff-analytics" | "staff-kanban";
@@ -87,6 +89,7 @@ export default function App() {
 
   const [isDarkMode, setIsDarkMode] = useState<boolean>(false);
   const [showNotifications, setShowNotifications] = useState<boolean>(false);
+  const [isNotificationsExpanded, setIsNotificationsExpanded] = useState<boolean>(false);
 
   const [isAuthMode, setIsAuthMode] = useState<"login" | "register">("login");
   const [email, setEmail] = useState<string>("");
@@ -102,7 +105,12 @@ export default function App() {
       message: `Your ${i.category} report is now ${i.status}.`,
       time: i.reportedAt,
     }))
+    .sort((a, b) => new Date(b.time).getTime() - new Date(a.time).getTime())
     .slice(0, 5);
+    
+  const currentUserIssues = issues.filter(i => i.reportedByUid === user?.uid);
+  const liveReportsCount = currentUserIssues.length;
+  const liveImpactPoints = 20 + currentUserIssues.reduce((sum, i) => sum + 10 + (i.status === "Resolved" ? 50 : 0), 0);
 
   useEffect(() => {
     // If a sandbox session was stored previously, initialize it right away
@@ -433,8 +441,8 @@ export default function App() {
           rank: 99,
           displayName: profile.displayName || "You",
           civicRank: profile.civicRank || "Civic Novice",
-          impactPoints: profile.impactPoints || 20,
-          reportsCount: profile.reportsCount || 0,
+          impactPoints: liveImpactPoints,
+          reportsCount: liveReportsCount,
           isCurrent: true,
         });
       }
@@ -481,29 +489,15 @@ export default function App() {
           initial={{ opacity: 0, scale: 0.9 }}
           animate={{ opacity: 1, scale: 1 }}
           transition={{ duration: 0.5, type: "spring" }}
-          className="flex flex-col items-center gap-6"
+          className="flex flex-col items-center gap-6 relative"
         >
-          <div className="w-20 h-20 bg-primary rounded-3xl flex items-center justify-center shadow-xl shadow-primary/20">
-            <svg
-              width="40"
-              height="40"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="white"
-              strokeWidth="2.5"
-            >
-              <path d="M3 21h18M3 7l9-4 9 4v10H3V7z"></path>
-            </svg>
-          </div>
-          <div className="space-y-2 text-center">
-            <h1 className="text-2xl font-bold tracking-tight text-gray-900 dark:text-white">
-              C.I.V.I.C.
-            </h1>
-            <div className="flex gap-1.5 justify-center mt-4">
-              <div className="w-2 h-2 rounded-full bg-primary animate-bounce [animation-delay:-0.3s]"></div>
-              <div className="w-2 h-2 rounded-full bg-primary animate-bounce [animation-delay:-0.15s]"></div>
-              <div className="w-2 h-2 rounded-full bg-primary animate-bounce"></div>
-            </div>
+          <div className="relative flex items-center justify-center">
+            <div className="absolute inset-0 border-4 border-primary/20 border-t-primary rounded-full animate-spin w-28 h-28 -m-4"></div>
+            <img 
+              src="/civic-logo.svg" 
+              alt="Loading CIVIC" 
+              className="w-20 h-20 animate-pulse drop-shadow-xl dark:invert z-10" 
+            />
           </div>
         </motion.div>
       </div>
@@ -514,19 +508,7 @@ export default function App() {
     <div className="min-h-screen bg-gray-50 dark:bg-gray-950 flex flex-col justify-between font-sans text-[#1A1A1A] dark:text-white transition-colors duration-300">
       <header className="h-16 bg-white/80 dark:bg-gray-900/80 backdrop-blur-md border-b border-[#E5E5E5] dark:border-gray-800 flex items-center justify-between px-6 z-10 w-full sticky top-0">
         <div className="flex items-center gap-3">
-          <div className="w-8 h-8 bg-primary rounded-xl flex items-center justify-center shadow-sm">
-            <svg
-              width="18"
-              height="18"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="white"
-              strokeWidth="2.5"
-            >
-              <path d="M3 21h18M3 7l9-4 9 4v10H3V7z"></path>
-            </svg>
-          </div>
-          <h1 className="text-lg font-bold tracking-tight">C.I.V.I.C.</h1>
+          <img src="/civic-wordmark.svg" alt="CIVIC" className="h-6 sm:h-7 dark:invert" />
         </div>
 
         <div className="flex items-center gap-4 relative">
@@ -597,12 +579,34 @@ export default function App() {
                   </div>
                   
                   {userNotifications.length > 0 && (
-                    <div className="px-4 py-2 border-b border-[#F0F0F0] dark:border-gray-800 bg-red-50/50 dark:bg-red-900/10">
-                      <p className="text-[10px] text-red-600 dark:text-red-400 font-bold uppercase tracking-wider mb-2 flex items-center gap-1.5">
-                        <Bell className="w-3 h-3" /> Notifications
-                      </p>
+                    <div 
+                      className={`px-4 py-2 border-b border-[#F0F0F0] dark:border-gray-800 bg-red-50/50 dark:bg-red-900/10 ${userNotifications.length > 1 ? 'cursor-pointer hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors' : ''}`}
+                      onClick={() => {
+                        if (userNotifications.length > 1) {
+                          setIsNotificationsExpanded(!isNotificationsExpanded);
+                        }
+                      }}
+                      role={userNotifications.length > 1 ? "button" : "region"}
+                      tabIndex={userNotifications.length > 1 ? 0 : undefined}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' || e.key === ' ') {
+                          e.preventDefault();
+                          if (userNotifications.length > 1) setIsNotificationsExpanded(!isNotificationsExpanded);
+                        }
+                      }}
+                    >
+                      <div className="flex items-center justify-between mb-2">
+                        <p className="text-[10px] text-red-600 dark:text-red-400 font-bold uppercase tracking-wider flex items-center gap-1.5">
+                          <Bell className="w-3 h-3" /> Notifications
+                        </p>
+                        {userNotifications.length > 1 && (
+                          <span className="text-[10px] text-red-600/70 dark:text-red-400/70 font-semibold">
+                            {isNotificationsExpanded ? "Show Less" : `+${userNotifications.length - 1} more`}
+                          </span>
+                        )}
+                      </div>
                       <div className="space-y-2">
-                        {userNotifications.map((n) => (
+                        {(isNotificationsExpanded ? userNotifications : [userNotifications[0]]).map((n) => (
                           <div key={n.id} className="text-xs text-gray-800 dark:text-gray-200">
                             <span className="font-semibold block">{n.message}</span>
                             <span className="text-[9px] text-gray-500">{new Date(n.time).toLocaleTimeString()}</span>
@@ -632,7 +636,7 @@ export default function App() {
                         className="w-full text-left px-4 py-2.5 text-xs font-semibold text-[#1A1A1A] dark:text-white hover:bg-[#F5F5F5] dark:hover:bg-gray-800 transition-colors flex items-center gap-2.5 cursor-pointer"
                       >
                         <FileText className="w-4 h-4 text-[#717171] dark:text-gray-400" />
-                        My Reports ({profile?.reportsCount || 0})
+                        My Reports ({liveReportsCount})
                       </button>
                     </>
                   ) : (
@@ -665,165 +669,166 @@ export default function App() {
       </header>
 
       <main
-        className={`${activeTab === "map" && user ? "flex-1 w-full relative" : "max-w-7xl mx-auto px-4 py-8 flex-1 w-full flex flex-col gap-6"}`}
+        className={`${activeTab === "map" && user ? "flex-1 w-full relative" : (!user ? "flex-1 w-full flex flex-col sm:max-w-7xl sm:mx-auto sm:px-4 sm:py-8" : "max-w-7xl mx-auto px-4 py-8 flex-1 w-full flex flex-col gap-6")}`}
       >
         {!user ? (
-          <div className="max-w-sm w-full mx-auto bg-white dark:bg-gray-900 rounded-2xl border border-[#E5E5E5] dark:border-gray-800 overflow-hidden p-8 space-y-6 self-center shadow-[-10px_0_15px_rgba(0,0,0,0.02)]">
-            <div className="text-center space-y-2">
-              <h2
-                id="civic-ledger-title"
-                className="text-2xl font-light tracking-tight text-[#1A1A1A] dark:text-white"
-              >
-                C.I.V.I.C Ledger
-              </h2>
-              <p className="text-[#717171] dark:text-gray-400 text-sm leading-normal">
-                Join C.I.V.I.C. (Community Infrastructure Verification &
-                Intelligent Clustering) to log visual infrastructure issues,
-                claim points, and compare leaderboards.
-              </p>
-            </div>
-
-            <div className="flex bg-[#F5F5F5] dark:bg-gray-800 p-1 rounded-xl mb-6">
-              <button
-                onClick={() => setLoginRoleTab("citizen")}
-                className={`flex-1 py-2 rounded-lg text-xs font-bold transition-all ${loginRoleTab === "citizen" ? "bg-white dark:bg-gray-700 shadow-sm text-[#1A1A1A] dark:text-white" : "text-[#717171] dark:text-gray-400 hover:text-[#1A1A1A] dark:hover:text-white hover:bg-[#E5E5E5] dark:hover:bg-gray-700"}`}
-              >
-                Citizen Portal
-              </button>
-              <button
-                onClick={() => setLoginRoleTab("staff")}
-                className={`flex-1 py-2 rounded-lg text-xs font-bold transition-all ${loginRoleTab === "staff" ? "bg-white dark:bg-gray-700 shadow-sm text-[#1A1A1A] dark:text-white" : "text-[#717171] dark:text-gray-400 hover:text-[#1A1A1A] dark:hover:text-white hover:bg-[#E5E5E5] dark:hover:bg-gray-700"}`}
-              >
-                Staff Access
-              </button>
-            </div>
-
-            {authError && (
-              <div className="bg-[#FEE2E2] dark:bg-red-900/30 border border-[#FCA5A5] dark:border-red-800 text-xs text-[#B91C1C] dark:text-red-400 p-3 rounded-xl flex gap-2">
-                <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
-                <span>{authError}</span>
-              </div>
-            )}
-
-            <div className="space-y-3">
-              <button
-                onClick={handleInstantGuestSignIn}
-                disabled={authLoading}
-                className="w-full bg-[#1A1A1A] dark:bg-white hover:bg-[#333333] dark:hover:bg-gray-200 text-white dark:text-gray-900 text-xs font-bold py-3.5 px-4 rounded-full transition-all flex items-center justify-center gap-2 cursor-pointer"
-              >
-                <PlusCircle className="w-4 h-4" />
-                <span>
-                  {loginRoleTab === "staff"
-                    ? "Simulate Staff Access"
-                    : "Developer Access"}
-                </span>
-              </button>
-              <button
-                onClick={handleGoogleSignIn}
-                disabled={authLoading}
-                className="w-full bg-white dark:bg-gray-800 hover:bg-[#F5F5F5] dark:hover:bg-gray-700 text-[#1A1A1A] dark:text-white border border-[#E5E5E5] dark:border-gray-700 text-xs font-bold py-3 px-4 rounded-full transition-all flex items-center justify-center gap-2 cursor-pointer"
-              >
-                <img
-                  src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg"
-                  alt="Google logo"
-                  className="w-4 h-4"
-                />
-                <span>Google Connect</span>
-              </button>
-            </div>
-
-            <div className="relative flex py-2 items-center text-[#E5E5E5] dark:text-gray-700">
-              <div className="flex-grow border-t border-[#E5E5E5] dark:border-gray-700"></div>
-              <span className="flex-shrink mx-3 text-[10px] uppercase font-bold tracking-widest text-[#9CA3AF] dark:text-gray-500 font-mono">
-                OR EMAIL
-              </span>
-              <div className="flex-grow border-t border-[#E5E5E5] dark:border-gray-700"></div>
-            </div>
-
-            <form
-              onSubmit={
-                isAuthMode === "login" ? handleEmailLogin : handleEmailRegister
-              }
-              className="space-y-4"
+          <div className="flex-1 w-full flex items-center justify-center relative overflow-hidden bg-gray-50 dark:bg-gray-900 sm:rounded-3xl mx-auto my-auto max-w-7xl h-full sm:h-[90vh] sm:max-h-[900px]">
+            {/* Animated background gradient */}
+            <motion.div
+              className="absolute inset-0 z-0 opacity-40 dark:opacity-60"
+              animate={{
+                background: [
+                  "radial-gradient(circle at 0% 0%, var(--color-brand-teal) 0%, transparent 50%)",
+                  "radial-gradient(circle at 100% 100%, var(--color-brand-blue) 0%, transparent 50%)",
+                  "radial-gradient(circle at 0% 100%, var(--color-brand-teal-light) 0%, transparent 50%)",
+                  "radial-gradient(circle at 100% 0%, var(--color-brand-ink) 0%, transparent 50%)",
+                  "radial-gradient(circle at 0% 0%, var(--color-brand-teal) 0%, transparent 50%)",
+                ]
+              }}
+              transition={{ duration: 20, ease: "linear", repeat: Infinity }}
+            />
+            
+            <motion.div 
+              initial={{ opacity: 0, y: 20, scale: 0.95 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              transition={{ type: "spring", stiffness: 300, damping: 30 }}
+              className="max-w-md w-full mx-auto glass-card rounded-t-[2rem] sm:rounded-[2rem] overflow-y-auto p-6 sm:p-10 space-y-6 sm:space-y-8 z-10 mt-12 sm:m-4 shadow-2xl backdrop-blur-xl bg-white/70 dark:bg-gray-900/70 border border-white/20 dark:border-gray-800/50 absolute bottom-0 sm:relative sm:bottom-auto h-auto max-h-[85vh] sm:max-h-[calc(100%-2rem)] flex flex-col"
             >
-              {isAuthMode === "register" && (
-                <div className="space-y-1">
-                  <label className="text-[10px] text-[#717171] dark:text-gray-400 font-bold uppercase tracking-wider block">
-                    Full Name
-                  </label>
-                  <input
-                    type="text"
-                    placeholder="e.g. Marie Curie"
-                    value={name}
-                    onChange={(e) => setName(e.target.value)}
-                    required
-                    className="w-full text-xs px-3 py-2.5 bg-white dark:bg-gray-800 text-gray-900 dark:text-white border border-[#E5E5E5] dark:border-gray-700 rounded-xl focus:outline-none focus:border-[#1A1A1A] dark:focus:border-gray-400"
-                  />
-                </div>
-              )}
-              <div className="space-y-1">
-                <label className="text-[10px] text-[#717171] dark:text-gray-400 font-bold uppercase tracking-wider block">
-                  Email Address
-                </label>
-                <input
-                  type="email"
-                  placeholder="name@example.com"
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                  required
-                  className="w-full text-xs px-3 py-2.5 bg-white dark:bg-gray-800 text-gray-900 dark:text-white border border-[#E5E5E5] dark:border-gray-700 rounded-xl focus:outline-none focus:border-[#1A1A1A] dark:focus:border-gray-400"
-                />
+              <div className="text-center space-y-3">
+                <h1 className="font-display font-bold text-4xl sm:text-5xl tracking-tight text-gray-900 dark:text-white">
+                  C.I.V.I.C.
+                </h1>
+                <p className="text-gray-500 dark:text-gray-400 text-sm font-medium tracking-wide">
+                  Report it. Track it. Fix it together.
+                </p>
               </div>
-              <div className="space-y-1">
-                <label className="text-[10px] text-[#717171] dark:text-gray-400 font-bold uppercase tracking-wider block">
-                  Secret Password
-                </label>
-                <input
-                  type="password"
-                  placeholder="••••••••"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  required
-                  minLength={6}
-                  className="w-full text-xs px-3 py-2.5 bg-white dark:bg-gray-800 text-gray-900 dark:text-white border border-[#E5E5E5] dark:border-gray-700 rounded-xl focus:outline-none focus:border-[#1A1A1A] dark:focus:border-gray-400"
-                />
-              </div>
-              <button
-                type="submit"
-                disabled={authLoading}
-                className="w-full bg-[#1A1A1A] dark:bg-white hover:bg-[#333333] dark:hover:bg-gray-200 text-white dark:text-gray-900 font-bold py-3 rounded-full text-xs transition-all cursor-pointer"
-              >
-                {authLoading
-                  ? "Verifying..."
-                  : isAuthMode === "login"
-                    ? "Login"
-                    : "Create Account"}
-              </button>
-            </form>
 
-            <div className="text-center text-xs">
-              {isAuthMode === "login" ? (
-                <p className="text-[#717171] dark:text-gray-400">
-                  New here?{" "}
-                  <button
-                    onClick={() => setIsAuthMode("register")}
-                    className="text-[#1A1A1A] dark:text-white border-b border-[#1A1A1A] dark:border-white font-bold cursor-pointer"
-                  >
-                    Register
-                  </button>
-                </p>
-              ) : (
-                <p className="text-[#717171] dark:text-gray-400">
-                  Have an account?{" "}
-                  <button
-                    onClick={() => setIsAuthMode("login")}
-                    className="text-[#1A1A1A] dark:text-white border-b border-[#1A1A1A] dark:border-white font-bold cursor-pointer"
-                  >
-                    Login
-                  </button>
-                </p>
+              <div className="flex bg-gray-100/50 dark:bg-gray-800/50 p-1.5 rounded-2xl mb-8 backdrop-blur-sm">
+                <button
+                  onClick={() => setLoginRoleTab("citizen")}
+                  className={`flex-1 py-2.5 rounded-xl text-xs font-bold transition-all duration-300 ${loginRoleTab === "citizen" ? "bg-white dark:bg-gray-700 shadow-md text-gray-900 dark:text-white" : "text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white hover:bg-gray-200/50 dark:hover:bg-gray-700/50"}`}
+                >
+                  Citizen
+                </button>
+                <button
+                  onClick={() => setLoginRoleTab("staff")}
+                  className={`flex-1 py-2.5 rounded-xl text-xs font-bold transition-all duration-300 ${loginRoleTab === "staff" ? "bg-white dark:bg-gray-700 shadow-md text-gray-900 dark:text-white" : "text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white hover:bg-gray-200/50 dark:hover:bg-gray-700/50"}`}
+                >
+                  Staff
+                </button>
+              </div>
+
+              {authError && (
+                <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: "auto" }} className="bg-red-50 dark:bg-red-900/30 border border-red-200 dark:border-red-800/50 text-xs text-red-600 dark:text-red-400 p-3.5 rounded-xl flex gap-2 items-start">
+                  <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                  <span className="leading-relaxed">{authError}</span>
+                </motion.div>
               )}
-            </div>
+
+              <div className="space-y-4">
+                <button
+                  onClick={handleGoogleSignIn}
+                  disabled={authLoading}
+                  className="w-full bg-white dark:bg-gray-800 hover:bg-gray-50 dark:hover:bg-gray-700 text-gray-900 dark:text-white border border-gray-200 dark:border-gray-700 text-sm font-bold py-3.5 px-4 rounded-2xl transition-all duration-300 flex items-center justify-center gap-3 cursor-pointer shadow-sm hover:shadow-md"
+                >
+                  <img
+                    src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg"
+                    alt="Google logo"
+                    className="w-5 h-5"
+                  />
+                  <span>Continue with Google</span>
+                </button>
+                
+                <div className="relative flex py-4 items-center">
+                  <div className="flex-grow border-t border-gray-200 dark:border-gray-700"></div>
+                  <span className="flex-shrink mx-4 text-[10px] uppercase font-bold tracking-widest text-gray-400 dark:text-gray-500">
+                    OR
+                  </span>
+                  <div className="flex-grow border-t border-gray-200 dark:border-gray-700"></div>
+                </div>
+
+                <form
+                  onSubmit={isAuthMode === "login" ? handleEmailLogin : handleEmailRegister}
+                  className="space-y-4"
+                >
+                  {isAuthMode === "register" && (
+                    <motion.div initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }} className="relative">
+                      <input
+                        type="text"
+                        id="name"
+                        placeholder=" "
+                        value={name}
+                        onChange={(e) => setName(e.target.value)}
+                        required
+                        className="block w-full px-4 py-3.5 text-sm bg-white/50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-700 rounded-2xl appearance-none focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent peer text-gray-900 dark:text-white backdrop-blur-sm transition-all"
+                      />
+                      <label htmlFor="name" className="absolute text-sm text-gray-500 dark:text-gray-400 duration-300 transform -translate-y-4 scale-75 top-2 z-10 origin-[0] bg-transparent px-2 peer-focus:px-2 peer-placeholder-shown:scale-100 peer-placeholder-shown:-translate-y-1/2 peer-placeholder-shown:top-1/2 peer-focus:top-2 peer-focus:scale-75 peer-focus:-translate-y-4 left-2">Full Name</label>
+                    </motion.div>
+                  )}
+                  <div className="relative">
+                    <input
+                      type="email"
+                      id="email"
+                      placeholder=" "
+                      value={email}
+                      onChange={(e) => setEmail(e.target.value)}
+                      required
+                      className="block w-full px-4 py-3.5 text-sm bg-white/50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-700 rounded-2xl appearance-none focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent peer text-gray-900 dark:text-white backdrop-blur-sm transition-all"
+                    />
+                    <label htmlFor="email" className="absolute text-sm text-gray-500 dark:text-gray-400 duration-300 transform -translate-y-4 scale-75 top-2 z-10 origin-[0] bg-transparent px-2 peer-focus:px-2 peer-placeholder-shown:scale-100 peer-placeholder-shown:-translate-y-1/2 peer-placeholder-shown:top-1/2 peer-focus:top-2 peer-focus:scale-75 peer-focus:-translate-y-4 left-2">Email Address</label>
+                  </div>
+                  <div className="relative">
+                    <input
+                      type="password"
+                      id="password"
+                      placeholder=" "
+                      value={password}
+                      onChange={(e) => setPassword(e.target.value)}
+                      required
+                      minLength={6}
+                      className="block w-full px-4 py-3.5 text-sm bg-white/50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-700 rounded-2xl appearance-none focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent peer text-gray-900 dark:text-white backdrop-blur-sm transition-all"
+                    />
+                    <label htmlFor="password" className="absolute text-sm text-gray-500 dark:text-gray-400 duration-300 transform -translate-y-4 scale-75 top-2 z-10 origin-[0] bg-transparent px-2 peer-focus:px-2 peer-placeholder-shown:scale-100 peer-placeholder-shown:-translate-y-1/2 peer-placeholder-shown:top-1/2 peer-focus:top-2 peer-focus:scale-75 peer-focus:-translate-y-4 left-2">Password</label>
+                  </div>
+                  <button
+                    type="submit"
+                    disabled={authLoading}
+                    className="w-full bg-primary hover:bg-primary-dark text-white font-bold py-3.5 rounded-2xl text-sm transition-all duration-300 cursor-pointer shadow-md hover:shadow-lg disabled:opacity-70 flex items-center justify-center"
+                  >
+                    {authLoading ? (
+                      <img src="/civic-logo.svg" className="w-5 h-5 animate-pulse invert" alt="Loading" />
+                    ) : (
+                      isAuthMode === "login" ? "Sign In" : "Create Account"
+                    )}
+                  </button>
+                </form>
+
+                <div className="text-center mt-6">
+                  <button
+                    onClick={() => setIsAuthMode(isAuthMode === "login" ? "register" : "login")}
+                    className="text-xs text-primary hover:text-primary-dark dark:hover:text-primary-light font-semibold transition-colors"
+                  >
+                    {isAuthMode === "login"
+                      ? "Need an account? Sign up"
+                      : "Already have an account? Sign in"}
+                  </button>
+                </div>
+                
+                <div className="pt-4 border-t border-gray-200 dark:border-gray-700 text-center">
+                   <button
+                    onClick={handleInstantGuestSignIn}
+                    disabled={authLoading}
+                    className="text-xs text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white font-semibold transition-colors flex items-center justify-center gap-1.5 mx-auto"
+                  >
+                    <span>
+                      {loginRoleTab === "staff"
+                        ? "Explore as Staff (Guest)"
+                        : "Continue as Guest"}
+                    </span>
+                  </button>
+                </div>
+              </div>
+            </motion.div>
           </div>
         ) : (
           <div
@@ -841,38 +846,52 @@ export default function App() {
             >
               <Suspense fallback={
                 <div className="flex flex-col items-center justify-center h-64 space-y-4">
-                  <div className="w-8 h-8 border-4 border-primary border-t-transparent rounded-full animate-spin"></div>
-                  <p className="text-sm text-gray-500 font-medium animate-pulse">Loading view...</p>
+                  <div className="relative flex items-center justify-center">
+                    <div className="absolute inset-0 border-2 border-primary/20 border-t-primary rounded-full animate-spin w-16 h-16 -m-3"></div>
+                    <img src="/civic-logo.svg" className="w-10 h-10 animate-pulse dark:invert opacity-80 z-10" alt="Loading view" />
+                  </div>
+                  <p className="text-sm text-gray-500 font-medium animate-pulse mt-4">Loading...</p>
                 </div>
               }>
-                {activeTab === "reporter" && (
-                  <Reporter currentUser={user} onSuccess={handleReportScored} />
-                )}
-                {activeTab === "map" && (
-                  <CommandMap
-                    issues={issues}
-                    currentUser={user}
-                    selectedIssueFromParent={selectedIssueFromParent}
-                    isDarkMode={isDarkMode}
-                  />
-                )}
-                {activeTab === "impact" && (
-                  <ImpactDashboard currentUser={user} currentProfile={profile} />
-                )}
-                {activeTab === "staff-list" && (
-                  <StaffReportsList
-                    issues={issues}
-                    currentUser={user}
-                    onSelectIssue={(issue) => setSelectedIssueFromParent(issue)}
-                    onSetTab={(tab) => setActiveTab(tab)}
-                  />
-                )}
-                {activeTab === "staff-analytics" && (
-                  <StaffDashboard issues={issues} />
-                )}
-                {activeTab === "staff-kanban" && (
-                  <SmartAssignmentBoard issues={issues} />
-                )}
+                <AnimatePresence mode="wait">
+                  <motion.div
+                    key={activeTab}
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -10 }}
+                    transition={{ duration: 0.2 }}
+                    className={activeTab === "map" ? "h-full w-full" : ""}
+                  >
+                    {activeTab === "reporter" && (
+                      <Reporter currentUser={user} onSuccess={handleReportScored} isDarkMode={isDarkMode} />
+                    )}
+                    {activeTab === "map" && (
+                      <CommandMap
+                        issues={issues}
+                        currentUser={user}
+                        selectedIssueFromParent={selectedIssueFromParent}
+                        isDarkMode={isDarkMode}
+                      />
+                    )}
+                    {activeTab === "impact" && (
+                      <ImpactDashboard currentUser={user} currentProfile={profile} issues={issues} />
+                    )}
+                    {activeTab === "staff-list" && (
+                      <StaffReportsList
+                        issues={issues}
+                        currentUser={user}
+                        onSelectIssue={(issue) => setSelectedIssueFromParent(issue)}
+                        onSetTab={(tab) => setActiveTab(tab)}
+                      />
+                    )}
+                    {activeTab === "staff-analytics" && (
+                      <StaffDashboard issues={issues} />
+                    )}
+                    {activeTab === "staff-kanban" && (
+                      <SmartAssignmentBoard issues={issues} />
+                    )}
+                  </motion.div>
+                </AnimatePresence>
               </Suspense>
             </div>
           </div>
@@ -895,7 +914,7 @@ export default function App() {
             {profile.role !== "staff" && (
               <button
                 onClick={() => setActiveTab("reporter")}
-                className="relative px-5 py-2.5 rounded-full text-xs font-bold transition-colors cursor-pointer group flex items-center gap-2"
+                className="relative px-4 sm:px-5 py-2.5 rounded-full text-xs font-bold transition-colors cursor-pointer group flex items-center gap-2"
               >
                 {activeTab === "reporter" && (
                   <motion.div
@@ -908,7 +927,7 @@ export default function App() {
                   className={`w-4 h-4 relative z-10 transition-colors ${activeTab === "reporter" ? "text-white" : "text-gray-600 dark:text-gray-300 group-hover:text-gray-900 dark:group-hover:text-white"}`}
                 />
                 <span
-                  className={`relative z-10 transition-colors ${activeTab === "reporter" ? "text-white" : "text-gray-600 dark:text-gray-300 group-hover:text-gray-900 dark:group-hover:text-white"}`}
+                  className={`relative z-10 transition-colors hidden sm:inline-block ${activeTab === "reporter" ? "text-white" : "text-gray-600 dark:text-gray-300 group-hover:text-gray-900 dark:group-hover:text-white"}`}
                 >
                   Report
                 </span>
@@ -920,7 +939,7 @@ export default function App() {
                 setActiveTab("map");
                 setSelectedIssueFromParent(null);
               }}
-              className="relative px-5 py-2.5 rounded-full text-xs font-bold transition-colors cursor-pointer group flex items-center gap-2"
+              className="relative px-4 sm:px-5 py-2.5 rounded-full text-xs font-bold transition-colors cursor-pointer group flex items-center gap-2"
             >
               {activeTab === "map" && (
                 <motion.div
@@ -933,7 +952,7 @@ export default function App() {
                 className={`w-4 h-4 relative z-10 transition-colors ${activeTab === "map" ? "text-white" : "text-gray-600 dark:text-gray-300 group-hover:text-gray-900 dark:group-hover:text-white"}`}
               />
               <span
-                className={`relative z-10 transition-colors ${activeTab === "map" ? "text-white" : "text-gray-600 dark:text-gray-300 group-hover:text-gray-900 dark:group-hover:text-white"}`}
+                className={`relative z-10 transition-colors hidden sm:inline-block ${activeTab === "map" ? "text-white" : "text-gray-600 dark:text-gray-300 group-hover:text-gray-900 dark:group-hover:text-white"}`}
               >
                 Map
               </span>
@@ -943,7 +962,7 @@ export default function App() {
               <>
                 <button
                   onClick={() => setActiveTab("staff-analytics")}
-                  className="relative px-5 py-2.5 rounded-full text-xs font-bold transition-colors cursor-pointer group flex items-center gap-2"
+                  className="relative px-4 sm:px-5 py-2.5 rounded-full text-xs font-bold transition-colors cursor-pointer group flex items-center gap-2"
                 >
                   {activeTab === "staff-analytics" && (
                     <motion.div
@@ -956,15 +975,18 @@ export default function App() {
                       }}
                     />
                   )}
+                  <Activity
+                    className={`w-4 h-4 relative z-10 transition-colors ${activeTab === "staff-analytics" ? "text-white" : "text-gray-600 dark:text-gray-300 group-hover:text-gray-900 dark:group-hover:text-white"}`}
+                  />
                   <span
-                    className={`relative z-10 transition-colors ${activeTab === "staff-analytics" ? "text-white" : "text-gray-600 dark:text-gray-300 group-hover:text-gray-900 dark:group-hover:text-white"}`}
+                    className={`relative z-10 transition-colors hidden sm:inline-block ${activeTab === "staff-analytics" ? "text-white" : "text-gray-600 dark:text-gray-300 group-hover:text-gray-900 dark:group-hover:text-white"}`}
                   >
                     Analytics
                   </span>
                 </button>
                 <button
                   onClick={() => setActiveTab("staff-kanban")}
-                  className="relative px-5 py-2.5 rounded-full text-xs font-bold transition-colors cursor-pointer group flex items-center gap-2"
+                  className="relative px-4 sm:px-5 py-2.5 rounded-full text-xs font-bold transition-colors cursor-pointer group flex items-center gap-2"
                 >
                   {activeTab === "staff-kanban" && (
                     <motion.div
@@ -977,15 +999,18 @@ export default function App() {
                       }}
                     />
                   )}
+                  <LayoutDashboard
+                    className={`w-4 h-4 relative z-10 transition-colors ${activeTab === "staff-kanban" ? "text-white" : "text-gray-600 dark:text-gray-300 group-hover:text-gray-900 dark:group-hover:text-white"}`}
+                  />
                   <span
-                    className={`relative z-10 transition-colors ${activeTab === "staff-kanban" ? "text-white" : "text-gray-600 dark:text-gray-300 group-hover:text-gray-900 dark:group-hover:text-white"}`}
+                    className={`relative z-10 transition-colors hidden sm:inline-block ${activeTab === "staff-kanban" ? "text-white" : "text-gray-600 dark:text-gray-300 group-hover:text-gray-900 dark:group-hover:text-white"}`}
                   >
                     Board
                   </span>
                 </button>
                 <button
                   onClick={() => setActiveTab("staff-list")}
-                  className="relative px-5 py-2.5 rounded-full text-xs font-bold transition-colors cursor-pointer group flex items-center gap-2"
+                  className="relative px-4 sm:px-5 py-2.5 rounded-full text-xs font-bold transition-colors cursor-pointer group flex items-center gap-2"
                 >
                   {activeTab === "staff-list" && (
                     <motion.div
@@ -1002,7 +1027,7 @@ export default function App() {
                     className={`w-4 h-4 relative z-10 transition-colors ${activeTab === "staff-list" ? "text-white" : "text-gray-600 dark:text-gray-300 group-hover:text-gray-900 dark:group-hover:text-white"}`}
                   />
                   <span
-                    className={`relative z-10 transition-colors ${activeTab === "staff-list" ? "text-white" : "text-gray-600 dark:text-gray-300 group-hover:text-gray-900 dark:group-hover:text-white"}`}
+                    className={`relative z-10 transition-colors hidden sm:inline-block ${activeTab === "staff-list" ? "text-white" : "text-gray-600 dark:text-gray-300 group-hover:text-gray-900 dark:group-hover:text-white"}`}
                   >
                     Archive
                   </span>
@@ -1013,7 +1038,7 @@ export default function App() {
             {profile.role !== "staff" && (
               <button
                 onClick={() => setActiveTab("impact")}
-                className="relative px-5 py-2.5 rounded-full text-xs font-bold transition-colors cursor-pointer group flex items-center gap-2"
+                className="relative px-4 sm:px-5 py-2.5 rounded-full text-xs font-bold transition-colors cursor-pointer group flex items-center gap-2"
               >
                 {activeTab === "impact" && (
                   <motion.div
@@ -1026,7 +1051,7 @@ export default function App() {
                   className={`w-4 h-4 relative z-10 transition-colors ${activeTab === "impact" ? "text-white" : "text-gray-600 dark:text-gray-300 group-hover:text-gray-900 dark:group-hover:text-white"}`}
                 />
                 <span
-                  className={`relative z-10 transition-colors ${activeTab === "impact" ? "text-white" : "text-gray-600 dark:text-gray-300 group-hover:text-gray-900 dark:group-hover:text-white"}`}
+                  className={`relative z-10 transition-colors hidden sm:inline-block ${activeTab === "impact" ? "text-white" : "text-gray-600 dark:text-gray-300 group-hover:text-gray-900 dark:group-hover:text-white"}`}
                 >
                   Impact
                 </span>

@@ -25,6 +25,7 @@ import {
   AlertTriangle,
   FileText,
   X,
+  ChevronDown,
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 
@@ -46,6 +47,7 @@ export default function StaffReportsList({
   const [categoryFilter, setCategoryFilter] = useState<string>("All");
   const [cityFilter, setCityFilter] = useState<string>("All");
   const [severityFilter, setSeverityFilter] = useState<string>("All");
+  const [showFiltersDropdown, setShowFiltersDropdown] = useState(false);
   const [showPurgeModal, setShowPurgeModal] = useState(false);
   const [deleteTargetId, setDeleteTargetId] = useState<string | null>(null);
   const [isPurging, setIsPurging] = useState(false);
@@ -54,6 +56,20 @@ export default function StaffReportsList({
     string | null
   >(null);
   const [selectedIssues, setSelectedIssues] = useState<Set<string>>(new Set());
+
+  const activeFilterCount =
+    (statusFilter !== "All" ? 1 : 0) +
+    (categoryFilter !== "All" ? 1 : 0) +
+    (cityFilter !== "All" ? 1 : 0) +
+    (severityFilter !== "All" ? 1 : 0);
+
+  const clearAllFilters = () => {
+    setStatusFilter("All");
+    setCategoryFilter("All");
+    setCityFilter("All");
+    setSeverityFilter("All");
+    setSearchTerm("");
+  };
 
   const handleSelectIssue = (id: string) => {
     const newSet = new Set(selectedIssues);
@@ -114,10 +130,25 @@ export default function StaffReportsList({
     if (selectedIssues.size === 0) return;
     try {
       const batch = writeBatch(db);
+      
+      const affectedUids = new Set<string>();
+      
       selectedIssues.forEach((id) => {
         const issueRef = doc(db, "issues", id);
         batch.update(issueRef, { status });
+        const issue = issues.find(i => i.id === id);
+        if (issue) affectedUids.add(issue.reportedByUid);
       });
+      
+      affectedUids.forEach((uid) => {
+        const userIssues = issues.filter(i => i.reportedByUid === uid);
+        const newImpactPoints = 20 + userIssues.reduce((sum, i) => {
+          const effectiveStatus = selectedIssues.has(i.id) ? status : i.status;
+          return sum + 10 + (effectiveStatus === "Resolved" ? 50 : 0);
+        }, 0);
+        batch.update(doc(db, "citizens", uid), { impactPoints: newImpactPoints });
+      });
+
       await batch.commit();
       setActionMessage(
         `Bulk updated ${selectedIssues.size} issues to "${status}"`,
@@ -192,8 +223,25 @@ export default function StaffReportsList({
     newStatus: CivicStatus,
   ) => {
     try {
+      const targetIssue = issues.find(i => i.id === issueId);
+      const batch = writeBatch(db);
       const issueRef = doc(db, "issues", issueId);
-      await updateDoc(issueRef, { status: newStatus });
+      batch.update(issueRef, { status: newStatus });
+      
+      if (targetIssue) {
+        // Recompute user's stats dynamically by substituting the updated status
+        const userIssues = issues.filter(i => i.reportedByUid === targetIssue.reportedByUid);
+        const newImpactPoints = 20 + userIssues.reduce((sum, i) => {
+          const effectiveStatus = i.id === issueId ? newStatus : i.status;
+          return sum + 10 + (effectiveStatus === "Resolved" ? 50 : 0);
+        }, 0);
+        
+        batch.update(doc(db, "citizens", targetIssue.reportedByUid), {
+          impactPoints: newImpactPoints
+        });
+      }
+
+      await batch.commit();
       setActionMessage(`Status streamlined/updated to "${newStatus}"`);
       setTimeout(() => setActionMessage(null), 3000);
     } catch (err: any) {
@@ -205,7 +253,23 @@ export default function StaffReportsList({
   const handleConfirmDeleteReport = async () => {
     if (!deleteTargetId) return;
     try {
-      await deleteDoc(doc(db, "issues", deleteTargetId));
+      const targetIssue = issues.find(i => i.id === deleteTargetId);
+      const batch = writeBatch(db);
+      batch.delete(doc(db, "issues", deleteTargetId));
+      
+      if (targetIssue) {
+        // Recompute user's stats dynamically from remaining issues
+        const remainingUserIssues = issues.filter(i => i.id !== deleteTargetId && i.reportedByUid === targetIssue.reportedByUid);
+        const newReportsCount = remainingUserIssues.length;
+        const newImpactPoints = 20 + remainingUserIssues.reduce((sum, i) => sum + 10 + (i.status === "Resolved" ? 50 : 0), 0);
+        
+        batch.update(doc(db, "citizens", targetIssue.reportedByUid), {
+          reportsCount: newReportsCount,
+          impactPoints: newImpactPoints
+        });
+      }
+
+      await batch.commit();
       setActionMessage("Report successfully deleted from the ledger.");
       setTimeout(() => setActionMessage(null), 3000);
     } catch (err: any) {
@@ -220,11 +284,20 @@ export default function StaffReportsList({
     setIsPurging(true);
     setShowPurgeModal(false);
     try {
-      const querySnapshot = await getDocs(collection(db, "issues"));
+      const issuesSnap = await getDocs(collection(db, "issues"));
+      const citizensSnap = await getDocs(collection(db, "citizens"));
       const batch = writeBatch(db);
 
-      querySnapshot.forEach((docSnap) => {
+      issuesSnap.forEach((docSnap) => {
         batch.delete(docSnap.ref);
+      });
+      
+      citizensSnap.forEach((docSnap) => {
+        batch.update(docSnap.ref, {
+          reportsCount: 0,
+          impactPoints: 20,
+          civicRank: "Civic Novice"
+        });
       });
 
       await batch.commit();
@@ -246,16 +319,29 @@ export default function StaffReportsList({
     return "bg-[#F3F4F6] text-[#4B5563] border-[#E5E7EB]";
   };
 
+  const getStatusBadgeStyle = (status: string) => {
+    switch (status) {
+      case "Reported":
+        return "bg-blue-50 text-blue-700 border-blue-200 dark:bg-blue-900/30 dark:text-blue-400 dark:border-blue-800";
+      case "Resolved":
+        return "bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-900/30 dark:text-emerald-400 dark:border-emerald-800";
+      case "In Progress":
+        return "bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-900/30 dark:text-amber-400 dark:border-amber-800";
+      default:
+        return "bg-gray-50 text-gray-700 border-gray-200 dark:bg-gray-800 dark:text-gray-400 dark:border-gray-700";
+    }
+  };
+
   return (
     <div className="bg-white dark:bg-gray-900 rounded-3xl border border-[#E5E5E5] dark:border-gray-800 overflow-hidden shadow-2xl dark:shadow-none max-w-7xl mx-auto p-6 space-y-6 relative">
       {/* Header section with Reset/Purge */}
       <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 pb-6 border-b border-[#F0F0F0] dark:border-gray-800">
         <div>
-          <h2 className="text-2xl font-light text-[#1A1A1A] dark:text-white tracking-tight flex items-center gap-2">
-            <FileText className="w-6 h-6 text-[#1A1A1A] dark:text-white" />
+          <h2 className="text-3xl font-display font-bold text-[#1A1A1A] dark:text-white tracking-tight flex items-center gap-2">
+            <FileText className="w-8 h-8 text-[#1A1A1A] dark:text-white" />
             Staff Control Dashboard
           </h2>
-          <p className="text-xs text-[#717171] dark:text-gray-400 mt-1">
+          <p className="text-sm text-[#717171] dark:text-gray-400 mt-2">
             Review, verify, and resolve issues reported across municipal bounds.
           </p>
         </div>
@@ -278,91 +364,131 @@ export default function StaffReportsList({
       )}
 
       {/* Filter and search bar */}
-      <div className="grid grid-cols-1 md:grid-cols-6 gap-3 bg-[#F9FAFB] dark:bg-gray-800/50 p-4 rounded-2xl border border-[#E5E7EB] dark:border-gray-800">
-        {/* Search Input */}
-        <div className="relative md:col-span-2">
-          <Search className="absolute left-3 top-2.5 w-4 h-4 text-[#9CA3AF] dark:text-gray-500" />
-          <input
-            type="text"
-            placeholder="Search details, reporter..."
-            value={searchTerm}
-            onChange={(e) => setSearchTerm(e.target.value)}
-            className="w-full text-xs pl-9 pr-4 py-2.5 bg-white dark:bg-gray-900 border border-[#E5E5E5] dark:border-gray-700 rounded-xl focus:outline-none focus:border-[#1A1A1A] dark:focus:border-gray-500 text-[#1A1A1A] dark:text-white"
-          />
+      <div className="flex flex-col gap-3 bg-[#F9FAFB] dark:bg-gray-800/50 p-4 rounded-2xl border border-[#E5E7EB] dark:border-gray-800 relative">
+        <div className="flex items-center justify-between gap-3 flex-wrap">
+          <div className="relative flex-1 min-w-[200px]">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-[#9CA3AF] dark:text-gray-500 pointer-events-none" />
+            <input
+              type="text"
+              placeholder="Search details, reporter..."
+              value={searchTerm}
+              onChange={(e) => setSearchTerm(e.target.value)}
+              className="w-full text-xs pl-9 pr-4 min-h-[44px] bg-white dark:bg-gray-900 border border-[#E5E5E5] dark:border-gray-700 rounded-xl focus:outline-none focus:ring-2 focus:ring-primary text-[#1A1A1A] dark:text-white transition-all"
+            />
+          </div>
+          
+          <button
+            onClick={() => setShowFiltersDropdown(!showFiltersDropdown)}
+            className={`min-h-[44px] flex items-center justify-center gap-2 px-4 rounded-xl border text-xs font-bold transition-all ${showFiltersDropdown ? "bg-gray-100 dark:bg-gray-700 border-gray-300 dark:border-gray-600 text-gray-900 dark:text-white" : "bg-white dark:bg-gray-900 border-[#E5E5E5] dark:border-gray-700 text-[#717171] dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800"}`}
+            aria-expanded={showFiltersDropdown}
+          >
+            <Filter className="w-4 h-4" />
+            Filters
+            {activeFilterCount > 0 && (
+              <span className="bg-primary text-white text-[10px] w-5 h-5 flex items-center justify-center rounded-full">
+                {activeFilterCount}
+              </span>
+            )}
+            <ChevronDown className={`w-4 h-4 transition-transform duration-300 ${showFiltersDropdown ? "rotate-180" : ""}`} />
+          </button>
         </div>
 
-        {/* Category Filter */}
-        <div>
-          <label className="block text-[9px] font-bold text-[#717171] dark:text-gray-400 uppercase tracking-wider mb-1">
-            Category
-          </label>
-          <select
-            value={categoryFilter}
-            onChange={(e) => setCategoryFilter(e.target.value)}
-            className="w-full text-xs px-3 py-2 bg-white dark:bg-gray-900 border border-[#E5E5E5] dark:border-gray-700 rounded-xl focus:outline-none focus:border-[#1A1A1A] dark:focus:border-gray-500 text-[#1A1A1A] dark:text-white font-medium"
-          >
-            <option value="All">All Categories</option>
-            <option value="Pothole">Pothole</option>
-            <option value="Water Leak">Water Leak</option>
-            <option value="Vandalism">Vandalism</option>
-            <option value="Streetlight Out">Streetlight Out</option>
-            <option value="Waste Issue">Waste Issue</option>
-            <option value="Other">Other Category</option>
-          </select>
-        </div>
+        <AnimatePresence>
+          {showFiltersDropdown && (
+            <motion.div
+              initial={{ height: 0, opacity: 0 }}
+              animate={{ height: "auto", opacity: 1 }}
+              exit={{ height: 0, opacity: 0 }}
+              className="overflow-hidden"
+            >
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 pt-4 border-t border-gray-200 dark:border-gray-700 mt-2">
+                {/* Category Filter */}
+                <div>
+                  <label className="block text-[9px] font-bold text-[#717171] dark:text-gray-400 uppercase tracking-wider mb-1">
+                    Category
+                  </label>
+                  <select
+                    value={categoryFilter}
+                    onChange={(e) => setCategoryFilter(e.target.value)}
+                    className="w-full text-xs px-3 min-h-[44px] bg-white dark:bg-gray-900 border border-[#E5E5E5] dark:border-gray-700 rounded-xl focus:outline-none focus:ring-2 focus:ring-primary text-[#1A1A1A] dark:text-white font-medium cursor-pointer"
+                  >
+                    <option value="All">All Categories</option>
+                    <option value="Pothole">Pothole</option>
+                    <option value="Water Leak">Water Leak</option>
+                    <option value="Vandalism">Vandalism</option>
+                    <option value="Streetlight Out">Streetlight Out</option>
+                    <option value="Waste Issue">Waste Issue</option>
+                    <option value="Other">Other</option>
+                  </select>
+                </div>
 
-        {/* Status Filter */}
-        <div>
-          <label className="block text-[9px] font-bold text-[#717171] dark:text-gray-400 uppercase tracking-wider mb-1">
-            Status
-          </label>
-          <select
-            value={statusFilter}
-            onChange={(e) => setStatusFilter(e.target.value)}
-            className="w-full text-xs px-3 py-2 bg-white dark:bg-gray-900 border border-[#E5E5E5] dark:border-gray-700 rounded-xl focus:outline-none focus:border-[#1A1A1A] dark:focus:border-gray-500 text-[#1A1A1A] dark:text-white font-medium"
-          >
-            <option value="All">All Statuses</option>
-            <option value="Reported">Reported</option>
-            <option value="Auto-Routed">Auto-Routed</option>
-            <option value="Requires Human Verification">Verify Report</option>
-            <option value="Corroborated Report">Corroborated</option>
-            <option value="In Progress">In Progress</option>
-            <option value="Resolved">Resolved</option>
-          </select>
-        </div>
+                {/* Status Filter */}
+                <div>
+                  <label className="block text-[9px] font-bold text-[#717171] dark:text-gray-400 uppercase tracking-wider mb-1">
+                    Status
+                  </label>
+                  <select
+                    value={statusFilter}
+                    onChange={(e) => setStatusFilter(e.target.value)}
+                    className="w-full text-xs px-3 min-h-[44px] bg-white dark:bg-gray-900 border border-[#E5E5E5] dark:border-gray-700 rounded-xl focus:outline-none focus:ring-2 focus:ring-primary text-[#1A1A1A] dark:text-white font-medium cursor-pointer"
+                  >
+                    <option value="All">All Statuses</option>
+                    <option value="Reported">Reported</option>
+                    <option value="Auto-Routed">Auto-Routed</option>
+                    <option value="Requires Human Verification">Verify Report</option>
+                    <option value="Corroborated Report">Corroborated</option>
+                    <option value="In Progress">In Progress</option>
+                    <option value="Resolved">Resolved</option>
+                  </select>
+                </div>
 
-        {/* City Filter */}
-        <div>
-          <label className="block text-[9px] font-bold text-[#717171] dark:text-gray-400 uppercase tracking-wider mb-1">
-            Region
-          </label>
-          <select
-            value={cityFilter}
-            onChange={(e) => setCityFilter(e.target.value)}
-            className="w-full text-xs px-3 py-2 bg-white dark:bg-gray-900 border border-[#E5E5E5] dark:border-gray-700 rounded-xl focus:outline-none focus:border-[#1A1A1A] dark:focus:border-gray-500 text-[#1A1A1A] dark:text-white font-medium"
-          >
-            <option value="All">All Regions</option>
-            <option value="Bangalore">Bangalore</option>
-            <option value="Other">Other Region</option>
-          </select>
-        </div>
+                {/* City Filter */}
+                <div>
+                  <label className="block text-[9px] font-bold text-[#717171] dark:text-gray-400 uppercase tracking-wider mb-1">
+                    Region
+                  </label>
+                  <select
+                    value={cityFilter}
+                    onChange={(e) => setCityFilter(e.target.value)}
+                    className="w-full text-xs px-3 min-h-[44px] bg-white dark:bg-gray-900 border border-[#E5E5E5] dark:border-gray-700 rounded-xl focus:outline-none focus:ring-2 focus:ring-primary text-[#1A1A1A] dark:text-white font-medium cursor-pointer"
+                  >
+                    <option value="All">All Regions</option>
+                    <option value="Bangalore">Bangalore</option>
+                    <option value="Other">Other Region</option>
+                  </select>
+                </div>
 
-        {/* Severity Filter */}
-        <div>
-          <label className="block text-[9px] font-bold text-[#717171] dark:text-gray-400 uppercase tracking-wider mb-1">
-            Severity
-          </label>
-          <select
-            value={severityFilter}
-            onChange={(e) => setSeverityFilter(e.target.value)}
-            className="w-full text-xs px-3 py-2 bg-white dark:bg-gray-900 border border-[#E5E5E5] dark:border-gray-700 rounded-xl focus:outline-none focus:border-[#1A1A1A] dark:focus:border-gray-500 text-[#1A1A1A] dark:text-white font-medium"
-          >
-            <option value="All">All Severities</option>
-            <option value="High">High Severity (8-10)</option>
-            <option value="Medium">Medium Severity (5-7)</option>
-            <option value="Low">Low Severity (1-4)</option>
-          </select>
-        </div>
+                {/* Severity Filter */}
+                <div>
+                  <label className="block text-[9px] font-bold text-[#717171] dark:text-gray-400 uppercase tracking-wider mb-1">
+                    Severity
+                  </label>
+                  <select
+                    value={severityFilter}
+                    onChange={(e) => setSeverityFilter(e.target.value)}
+                    className="w-full text-xs px-3 min-h-[44px] bg-white dark:bg-gray-900 border border-[#E5E5E5] dark:border-gray-700 rounded-xl focus:outline-none focus:ring-2 focus:ring-primary text-[#1A1A1A] dark:text-white font-medium cursor-pointer"
+                  >
+                    <option value="All">All Severities</option>
+                    <option value="High">High (8-10)</option>
+                    <option value="Medium">Medium (5-7)</option>
+                    <option value="Low">Low (1-4)</option>
+                  </select>
+                </div>
+              </div>
+
+              {(activeFilterCount > 0 || searchTerm) && (
+                <div className="flex justify-end mt-4">
+                  <button
+                    onClick={clearAllFilters}
+                    className="text-xs font-bold text-red-600 dark:text-red-400 min-h-[44px] px-4 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-xl transition-colors"
+                  >
+                    Clear All Filters
+                  </button>
+                </div>
+              )}
+            </motion.div>
+          )}
+        </AnimatePresence>
       </div>
 
       <div className="flex justify-between items-center bg-gray-50 border border-gray-200 dark:bg-gray-800 dark:border-gray-700 p-3 rounded-xl mt-4">
@@ -406,7 +532,7 @@ export default function StaffReportsList({
       </div>
 
       {/* Tabular Reports List */}
-      <div className="overflow-x-auto glass-card rounded-3xl mt-2">
+      <div className="overflow-x-auto overflow-y-auto max-h-[600px] glass-card rounded-3xl mt-2 relative">
         {filteredIssues.length === 0 ? (
           <div className="p-12 text-center text-[#717171] dark:text-gray-400 flex flex-col items-center justify-center space-y-3">
             <AlertTriangle className="w-8 h-8 text-[#9CA3AF] stroke-1" />
@@ -415,8 +541,8 @@ export default function StaffReportsList({
             </p>
           </div>
         ) : (
-          <table className="min-w-full divide-y divide-[#E5E5E5] dark:divide-gray-800 text-left">
-            <thead className="bg-gray-50/50 dark:bg-gray-800/30">
+          <table className="min-w-full divide-y divide-[#E5E5E5] dark:divide-gray-800 text-left block md:table">
+            <thead className="bg-gray-50/50 dark:bg-gray-800/30 sticky top-0 z-10 hidden md:table-header-group">
               <tr>
                 <th className="px-6 py-4 text-[10px] font-bold text-[#717171] dark:text-gray-400 uppercase tracking-wider">
                   <input
@@ -452,7 +578,7 @@ export default function StaffReportsList({
                 </th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-[#F0F0F0] dark:divide-gray-800 text-xs">
+            <tbody className="divide-y divide-[#F0F0F0] dark:divide-gray-800 text-xs block md:table-row-group">
               {filteredIssues.map((issue) => {
                 const issueCityName = getCityName(
                   issue.latitude,
@@ -474,18 +600,22 @@ export default function StaffReportsList({
                 return (
                   <tr
                     key={issue.id}
-                    className={`transition-colors ${isOverdue ? "bg-red-50 dark:bg-red-900/10 hover:bg-red-100 dark:hover:bg-red-900/20" : "hover:bg-gray-50/50 dark:hover:bg-gray-800/50"}`}
+                    className={`transition-colors block md:table-row border border-gray-200 dark:border-gray-800 md:border-0 rounded-2xl md:rounded-none mb-4 md:mb-0 p-4 md:p-0 ${isOverdue ? "bg-red-50 dark:bg-red-900/10 hover:bg-red-100 dark:hover:bg-red-900/20" : "bg-white dark:bg-gray-900 md:bg-transparent hover:bg-gray-50/50 dark:hover:bg-gray-800/50"}`}
                   >
-                    <td className="px-6 py-4">
-                      <input
-                        type="checkbox"
-                        checked={selectedIssues.has(issue.id)}
-                        onChange={() => handleSelectIssue(issue.id)}
-                        className="w-3 h-3"
-                      />
+                    <td className="px-0 py-2 md:px-6 md:py-4 block md:table-cell border-b border-gray-100 dark:border-gray-800 md:border-0">
+                      <div className="flex items-center justify-between md:justify-start">
+                        <span className="md:hidden text-[10px] font-bold text-gray-500 uppercase tracking-wider">Select</span>
+                        <input
+                          type="checkbox"
+                          checked={selectedIssues.has(issue.id)}
+                          onChange={() => handleSelectIssue(issue.id)}
+                          className="w-4 h-4 md:w-3 md:h-3 min-h-[44px] min-w-[44px] md:min-h-[auto] md:min-w-[auto] cursor-pointer"
+                        />
+                      </div>
                     </td>
                     {/* Thumbnail & description */}
-                    <td className="px-6 py-4 max-w-sm">
+                    <td className="px-0 py-3 md:px-6 md:py-4 max-w-sm block md:table-cell border-b border-gray-100 dark:border-gray-800 md:border-0">
+                      <div className="md:hidden text-[10px] font-bold text-gray-500 uppercase tracking-wider mb-2">Report</div>
                       <div className="flex items-center gap-3">
                         <div
                           className="w-12 h-12 rounded-2xl bg-gray-100 dark:bg-gray-800 overflow-hidden shrink-0 border border-[#E5E5E5] dark:border-gray-700 cursor-pointer relative group"
@@ -533,7 +663,8 @@ export default function StaffReportsList({
                     </td>
 
                     {/* Category & Severity */}
-                    <td className="px-6 py-4 whitespace-nowrap">
+                    <td className="px-0 py-3 md:px-6 md:py-4 whitespace-nowrap block md:table-cell border-b border-gray-100 dark:border-gray-800 md:border-0">
+                      <div className="md:hidden text-[10px] font-bold text-gray-500 uppercase tracking-wider mb-2">Category & Severity</div>
                       <div className="flex flex-col gap-1">
                         <span className="font-bold text-[#1A1A1A] dark:text-white">
                           {issue.category}
@@ -552,7 +683,8 @@ export default function StaffReportsList({
                     </td>
 
                     {/* Location */}
-                    <td className="px-6 py-4 whitespace-nowrap">
+                    <td className="px-0 py-3 md:px-6 md:py-4 whitespace-nowrap block md:table-cell border-b border-gray-100 dark:border-gray-800 md:border-0">
+                      <div className="md:hidden text-[10px] font-bold text-gray-500 uppercase tracking-wider mb-2">Location</div>
                       <div className="flex flex-col gap-0.5">
                         <span className="font-bold text-[#1a1a1a] dark:text-white flex items-center gap-1">
                           <MapPin className="w-3.5 h-3.5 text-[#3B82F6]" />
@@ -568,7 +700,7 @@ export default function StaffReportsList({
                               onSelectIssue(issue);
                               onSetTab("map");
                             }}
-                            className="text-left text-blue-600 dark:text-blue-400 hover:underline text-[10px] font-semibold mt-0.5 cursor-pointer"
+                            className="text-left text-blue-600 dark:text-blue-400 hover:underline text-[10px] font-semibold mt-0.5 cursor-pointer min-h-[44px] md:min-h-[auto] flex items-center"
                           >
                             Locate on Map
                           </button>
@@ -577,7 +709,8 @@ export default function StaffReportsList({
                     </td>
 
                     {/* Reporter Name & Date */}
-                    <td className="px-6 py-4 whitespace-nowrap">
+                    <td className="px-0 py-3 md:px-6 md:py-4 whitespace-nowrap block md:table-cell border-b border-gray-100 dark:border-gray-800 md:border-0">
+                      <div className="md:hidden text-[10px] font-bold text-gray-500 uppercase tracking-wider mb-2">Reporter</div>
                       <div className="flex flex-col">
                         <span className="font-medium text-[#1A1A1A] dark:text-white">
                           {issue.reportedByName || "Citizen"}
@@ -589,7 +722,8 @@ export default function StaffReportsList({
                     </td>
 
                     {/* Status Select dropdown */}
-                    <td className="px-6 py-4 id-status-select whitespace-nowrap">
+                    <td className="px-0 py-3 md:px-6 md:py-4 whitespace-nowrap block md:table-cell border-b border-gray-100 dark:border-gray-800 md:border-0">
+                      <div className="md:hidden text-[10px] font-bold text-gray-500 uppercase tracking-wider mb-2">Status</div>
                       <select
                         value={issue.status}
                         onChange={(e) =>
@@ -598,7 +732,7 @@ export default function StaffReportsList({
                             e.target.value as CivicStatus,
                           )
                         }
-                        className="text-xs font-semibold px-2.5 py-1.5 rounded-lg border border-[#E5E5E5] dark:border-gray-700 bg-[#F9FAFB] dark:bg-gray-800 focus:outline-none focus:border-[#1A1A1A] dark:focus:border-gray-500 text-[#1A1A1A] dark:text-white"
+                        className={`text-[10px] font-bold uppercase tracking-widest px-3 py-1.5 rounded-full border outline-none min-h-[44px] cursor-pointer appearance-none text-center ${getStatusBadgeStyle(issue.status)}`}
                       >
                         <option value="Reported">Reported</option>
                         <option value="Auto-Routed">Auto-Routed</option>
@@ -614,21 +748,27 @@ export default function StaffReportsList({
                     </td>
 
                     {/* Upvote count */}
-                    <td className="px-6 py-4 whitespace-nowrap text-center">
-                      <div className="inline-flex items-center gap-1.5 px-2 py-1 rounded bg-[#EFF6FF] border border-[#BFDBFE] text-blue-700 font-bold">
-                        <span>{issue.upvotesCount || 0}</span>
+                    <td className="px-0 py-3 md:px-6 md:py-4 whitespace-nowrap block md:table-cell border-b border-gray-100 dark:border-gray-800 md:border-0">
+                      <div className="flex items-center justify-between md:justify-center">
+                        <span className="md:hidden text-[10px] font-bold text-gray-500 uppercase tracking-wider">Upvotes</span>
+                        <div className="inline-flex items-center justify-center min-w-[44px] min-h-[44px] md:min-h-[auto] md:min-w-[auto] gap-1.5 px-2 py-1 rounded bg-[#EFF6FF] border border-[#BFDBFE] text-blue-700 font-bold">
+                          <span>{issue.upvotesCount || 0}</span>
+                        </div>
                       </div>
                     </td>
 
                     {/* Deletion / Action button */}
-                    <td className="px-6 py-4 whitespace-nowrap text-right">
-                      <button
-                        onClick={() => setDeleteTargetId(issue.id)}
-                        className="p-2 text-[#EF4444] hover:bg-[#FEE2E2] rounded-xl transition-all cursor-pointer"
-                        title="Delete Report"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </button>
+                    <td className="px-0 py-3 md:px-6 md:py-4 whitespace-nowrap block md:table-cell">
+                      <div className="flex items-center justify-between md:justify-end">
+                        <span className="md:hidden text-[10px] font-bold text-gray-500 uppercase tracking-wider">Actions</span>
+                        <button
+                          onClick={() => setDeleteTargetId(issue.id)}
+                          className="min-h-[44px] min-w-[44px] flex items-center justify-center text-[#EF4444] hover:bg-[#FEE2E2] rounded-xl transition-all cursor-pointer"
+                          title="Delete Report"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 );

@@ -4,6 +4,7 @@
 
 @theme {
   --font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Clash Display", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
 
   /* Base palette */
@@ -19,6 +20,12 @@
   --color-primary: var(--primary);
   --color-primary-light: var(--primary-light);
   --color-primary-dark: var(--primary-dark);
+
+  /* Brand Colors */
+  --color-brand-teal: #2F6F6A;
+  --color-brand-teal-light: #3FA095;
+  --color-brand-blue: #274B66;
+  --color-brand-ink: #1C2B2A;
 
   /* Semantic */
   --color-semantic-success: var(--semantic-success);
@@ -37,8 +44,8 @@
     --base-950: #09090B;
     
     --primary: #2F6F6A;
-    --primary-light: #E0F2F1;
-    --primary-dark: #1E4E4A;
+    --primary-light: #3FA095;
+    --primary-dark: #1C2B2A;
     
     --semantic-success: #34D399; /* Calm green */
     --semantic-warning: #FBBF24; /* Amber */

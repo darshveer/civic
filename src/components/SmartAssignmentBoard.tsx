@@ -33,7 +33,7 @@ export default function SmartAssignmentBoard({ issues }: KanbanProps) {
 
   return (
     <div className="p-6 bg-gray-50 dark:bg-gray-900 min-h-screen">
-      <h2 className="text-2xl font-bold mb-6 text-gray-900 dark:text-white">
+      <h2 className="text-3xl font-display font-bold mb-6 text-gray-900 dark:text-white tracking-tight">
         Smart Assignment Board
       </h2>
       <div className="flex gap-4 overflow-x-auto pb-4">
@@ -100,6 +100,29 @@ export default function SmartAssignmentBoard({ issues }: KanbanProps) {
                           {issue.priorityTier}
                         </span>
                       )}
+                    </div>
+                    
+                    <div className="mt-3 border-t border-gray-100 dark:border-gray-600 pt-3">
+                      <label className="sr-only">Move to status</label>
+                      <select
+                        value={issue.status}
+                        onChange={async (e) => {
+                          try {
+                            const issueRef = doc(db, "issues", issue.id);
+                            await updateDoc(issueRef, { status: e.target.value });
+                          } catch (err) {
+                            console.error(err);
+                          }
+                        }}
+                        className="w-full text-[10px] min-h-[44px] bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded-lg px-2 py-1 font-bold text-gray-700 dark:text-gray-300 focus:outline-none focus:ring-2 focus:ring-primary cursor-pointer transition-colors"
+                      >
+                        <option value="Reported">Move: Reported</option>
+                        <option value="Auto-Routed">Move: Auto-Routed</option>
+                        <option value="Requires Human Verification">Move: Verify Report</option>
+                        <option value="Corroborated Report">Move: Corroborated</option>
+                        <option value="In Progress">Move: In Progress</option>
+                        <option value="Resolved">Move: Resolved</option>
+                      </select>
                     </div>
                   </div>
                 ))}

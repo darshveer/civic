@@ -1,0 +1,5 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="CIVIC logo">
+  <!-- Monochromatic aesthetic 'C' and map pin -->
+  <path d="M 383 129 A 180 180 0 1 0 383 383" stroke="#1A1A1A" stroke-width="64" stroke-linecap="round" />
+  <path fill-rule="evenodd" clip-rule="evenodd" d="M 256 120 C 198.5 120 152 166.5 152 224 C 152 296 256 400 256 400 C 256 400 360 296 360 224 C 360 166.5 313.5 120 256 120 Z M 256 176 A 48 48 0 1 0 256 272 A 48 48 0 1 0 256 176 Z" fill="#1A1A1A"/>
+</svg>

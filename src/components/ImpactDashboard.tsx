@@ -12,16 +12,19 @@ import {
   limit,
   onSnapshot,
 } from "firebase/firestore";
-import { CitizenProfile, LeaderboardEntry } from "../types";
+import { CitizenProfile, LeaderboardEntry, CivicIssue } from "../types";
+import { calculateCivicRank } from "../lib/firebase";
 
 interface ImpactProps {
   currentUser: any;
   currentProfile: CitizenProfile | null;
+  issues: CivicIssue[];
 }
 
 export default function ImpactDashboard({
   currentUser,
   currentProfile,
+  issues,
 }: ImpactProps) {
   const [leaderboard, setLeaderboard] = useState<LeaderboardEntry[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
@@ -30,6 +33,12 @@ export default function ImpactDashboard({
     title: string;
     story: string;
   } | null>(null);
+
+  // Derive counts live from issues
+  const userIssues = issues.filter(i => i.reportedByUid === currentUser?.uid);
+  const liveReportsCount = userIssues.length;
+  const liveImpactPoints = 20 + userIssues.reduce((sum, i) => sum + 10 + (i.status === "Resolved" ? 50 : 0), 0);
+  const liveCivicRank = calculateCivicRank(liveImpactPoints);
 
   useEffect(() => {
     const q = query(
@@ -61,9 +70,9 @@ export default function ImpactDashboard({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           stats: {
-            reports: currentProfile.reportsCount || 0,
+            reports: liveReportsCount,
             resolved: 0, // In a real app we'd fetch this from their issues
-            points: currentProfile.impactPoints || 0,
+            points: liveImpactPoints,
           },
           language: "English",
         }),
@@ -109,7 +118,7 @@ export default function ImpactDashboard({
   };
 
   const progress = currentProfile
-    ? getProgressToNextRank(currentProfile.impactPoints)
+    ? getProgressToNextRank(liveImpactPoints)
     : null;
 
   return (
@@ -118,7 +127,7 @@ export default function ImpactDashboard({
         <div className="p-6 border-b border-[#E5E5E5] dark:border-gray-800">
           <div className="flex justify-between items-end mb-4">
             <div>
-              <h2 className="text-2xl font-bold tracking-tight text-[#1A1A1A] dark:text-white">
+              <h2 className="text-3xl font-display font-bold tracking-tight text-[#1A1A1A] dark:text-white mb-1">
                 Your Impact
               </h2>
               <p className="text-sm text-[#717171] dark:text-gray-400">
@@ -126,7 +135,7 @@ export default function ImpactDashboard({
               </p>
             </div>
             <div className="text-3xl font-light text-primary">
-              {currentProfile?.impactPoints || 0}{" "}
+              {liveImpactPoints}{" "}
               <span className="text-sm font-bold text-semantic-success">
                 pts
               </span>
@@ -159,7 +168,7 @@ export default function ImpactDashboard({
               </div>
               <div className="flex-1">
                 <div className="text-sm font-bold text-gray-900 dark:text-white mb-0.5">
-                  {currentProfile?.civicRank}
+                  {liveCivicRank}
                 </div>
                 <div className="text-[10px] font-bold text-gray-500 dark:text-gray-400 uppercase tracking-widest">
                   Next: {progress.nextTitle} ({progress.remaining} pts)
@@ -173,7 +182,7 @@ export default function ImpactDashboard({
           <div className="grid grid-cols-2 gap-3">
             <div className="p-4 rounded-2xl bg-white dark:bg-gray-900 border border-[#E5E5E5] dark:border-gray-700 flex flex-col items-center justify-center text-center shadow-sm">
               <span className="text-2xl text-[#1A1A1A] dark:text-white font-light mb-1">
-                {currentProfile?.reportsCount || 0}
+                {liveReportsCount}
               </span>
               <span className="text-[10px] uppercase tracking-widest font-bold text-[#717171] dark:text-gray-400">
                 Reports
@@ -181,7 +190,7 @@ export default function ImpactDashboard({
             </div>
             <div className="p-4 rounded-2xl bg-white dark:bg-gray-900 border border-[#E5E5E5] dark:border-gray-700 flex flex-col items-center justify-center text-center shadow-sm">
               <span className="text-2xl text-[#1A1A1A] dark:text-white font-light mb-1">
-                {(currentProfile?.impactPoints || 0) > 0 ? Math.floor((currentProfile?.impactPoints || 0) / 10) : 0}
+                {liveImpactPoints > 0 ? Math.floor(liveImpactPoints / 10) : 0}
               </span>
               <span className="text-[10px] uppercase tracking-widest font-bold text-[#717171] dark:text-gray-400">
                 Resolved
@@ -195,19 +204,19 @@ export default function ImpactDashboard({
             </h4>
             <div className="flex flex-wrap gap-4">
               <div className="flex flex-col items-center gap-2">
-                <div className={`w-14 h-14 rounded-full flex items-center justify-center text-2xl border-2 transition-all ${currentProfile?.reportsCount && currentProfile.reportsCount > 0 ? "bg-emerald-50 border-emerald-200 dark:bg-emerald-900/30 dark:border-emerald-800 shadow-sm scale-100" : "bg-gray-100 border-gray-200 dark:bg-gray-800 dark:border-gray-700 opacity-50 grayscale scale-95"}`} title="First Report">
+                <div className={`w-14 h-14 rounded-full flex items-center justify-center text-2xl border-2 transition-all ${liveReportsCount > 0 ? "bg-emerald-50 border-emerald-200 dark:bg-emerald-900/30 dark:border-emerald-800 shadow-sm scale-100" : "bg-gray-100 border-gray-200 dark:bg-gray-800 dark:border-gray-700 opacity-50 grayscale scale-95"}`} title="First Report">
                   🌱
                 </div>
                 <span className="text-[9px] font-bold uppercase tracking-widest text-gray-500 dark:text-gray-400 text-center w-16 leading-tight">First Report</span>
               </div>
               <div className="flex flex-col items-center gap-2">
-                <div className={`w-14 h-14 rounded-full flex items-center justify-center text-2xl border-2 transition-all ${currentProfile?.reportsCount && currentProfile.reportsCount >= 5 ? "bg-amber-50 border-amber-200 dark:bg-amber-900/30 dark:border-amber-800 shadow-sm scale-100" : "bg-gray-100 border-gray-200 dark:bg-gray-800 dark:border-gray-700 opacity-50 grayscale scale-95"}`} title="Streak Keeper">
+                <div className={`w-14 h-14 rounded-full flex items-center justify-center text-2xl border-2 transition-all ${liveReportsCount >= 5 ? "bg-amber-50 border-amber-200 dark:bg-amber-900/30 dark:border-amber-800 shadow-sm scale-100" : "bg-gray-100 border-gray-200 dark:bg-gray-800 dark:border-gray-700 opacity-50 grayscale scale-95"}`} title="Streak Keeper">
                   🔥
                 </div>
                 <span className="text-[9px] font-bold uppercase tracking-widest text-gray-500 dark:text-gray-400 text-center w-16 leading-tight">Streak Keeper</span>
               </div>
               <div className="flex flex-col items-center gap-2">
-                <div className={`w-14 h-14 rounded-full flex items-center justify-center text-2xl border-2 transition-all ${currentProfile?.impactPoints && currentProfile.impactPoints >= 100 ? "bg-blue-50 border-blue-200 dark:bg-blue-900/30 dark:border-blue-800 shadow-sm scale-100" : "bg-gray-100 border-gray-200 dark:bg-gray-800 dark:border-gray-700 opacity-50 grayscale scale-95"}`} title="Pothole Hunter">
+                <div className={`w-14 h-14 rounded-full flex items-center justify-center text-2xl border-2 transition-all ${liveImpactPoints >= 100 ? "bg-blue-50 border-blue-200 dark:bg-blue-900/30 dark:border-blue-800 shadow-sm scale-100" : "bg-gray-100 border-gray-200 dark:bg-gray-800 dark:border-gray-700 opacity-50 grayscale scale-95"}`} title="Pothole Hunter">
                   🕵️
                 </div>
                 <span className="text-[9px] font-bold uppercase tracking-widest text-gray-500 dark:text-gray-400 text-center w-16 leading-tight">Pothole Hunter</span>
@@ -227,7 +236,7 @@ export default function ImpactDashboard({
           >
             {isGeneratingStory ? (
               <span className="flex items-center gap-2">
-                <div className="w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+                <img src="/civic-logo.svg" className="w-4 h-4 animate-pulse brightness-0 invert" alt="Loading" />
                 Generating...
               </span>
             ) : (

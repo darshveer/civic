@@ -84,11 +84,13 @@ function PlacesContext({ location }: { location: { lat: number; lng: number } })
 function CommentsSection({ selectedIssue, currentUser }: { selectedIssue: CivicIssue, currentUser: any }) {
   const [newComment, setNewComment] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   const handleAddComment = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newComment.trim() || !currentUser) return;
     setIsSubmitting(true);
+    setErrorMsg(null);
     try {
       const issueRef = doc(db, "issues", selectedIssue.id);
       const comment = {
@@ -104,8 +106,9 @@ function CommentsSection({ selectedIssue, currentUser }: { selectedIssue: CivicI
       // Note: In real app, we should use arrayUnion but we do it this way to instantly update the UI if needed
       // Actually, since issues are passed down from onSnapshot in App.tsx, the prop will update shortly.
       setNewComment("");
-    } catch (err) {
+    } catch (err: any) {
       console.error("Failed to add comment:", err);
+      setErrorMsg("Failed to add comment.");
     }
     setIsSubmitting(false);
   };
@@ -116,6 +119,11 @@ function CommentsSection({ selectedIssue, currentUser }: { selectedIssue: CivicI
         <MessageCircle className="w-4 h-4 text-primary" />
         Comments ({selectedIssue.comments?.length || 0})
       </h4>
+      {errorMsg && (
+        <div className="p-3 bg-red-50 text-red-700 dark:bg-red-900/30 dark:text-red-400 text-xs rounded-xl mb-4">
+          {errorMsg}
+        </div>
+      )}
       <div className="space-y-4 mb-4 max-h-48 overflow-y-auto no-scrollbar">
         {selectedIssue.comments?.map(comment => (
           <div key={comment.id} className="bg-gray-50 dark:bg-gray-800/50 p-3 rounded-2xl">
@@ -687,9 +695,11 @@ export default function CommandMap({
                         disabled={isVerifying}
                         className="flex-1 bg-gray-900 dark:bg-white text-white dark:text-gray-900 py-3.5 rounded-2xl font-bold text-xs uppercase tracking-widest flex justify-center items-center gap-2 transition-colors cursor-pointer shadow-sm disabled:opacity-50"
                       >
-                        <CheckCircle
-                          className={`w-4 h-4 ${isVerifying ? "animate-spin" : ""}`}
-                        />
+                        {isVerifying ? (
+                          <img src="/civic-logo.svg" className="w-4 h-4 animate-pulse brightness-0 invert dark:invert-0" alt="Verifying" />
+                        ) : (
+                          <CheckCircle className="w-4 h-4" />
+                        )}
                         {isVerifying ? "Verifying..." : "Resolve Issue"}
                       </motion.button>
                     )}

@@ -22,14 +22,31 @@ import {
   increment,
 } from "firebase/firestore";
 import { TriageResult, CivicIssue } from "../types";
-import { useMapsLibrary } from "@vis.gl/react-google-maps";
+import { useMapsLibrary, Map as GoogleMap, AdvancedMarker, Pin, useMap } from "@vis.gl/react-google-maps";
 
 interface ReporterProps {
   onSuccess: (newIssue: any) => void;
   currentUser: any;
+  isDarkMode?: boolean;
 }
 
-export default function Reporter({ onSuccess, currentUser }: ReporterProps) {
+const API_KEY =
+  (process.env as any).GOOGLE_MAPS_PLATFORM_KEY ||
+  (import.meta as any).env?.VITE_GOOGLE_MAPS_PLATFORM_KEY ||
+  (globalThis as any).GOOGLE_MAPS_PLATFORM_KEY ||
+  "";
+
+function MapUpdater({ lat, lng }: { lat: number; lng: number }) {
+  const map = useMap("DEMO_MAP_ID");
+  useEffect(() => {
+    if (map) {
+      map.panTo({ lat, lng });
+    }
+  }, [map, lat, lng]);
+  return null;
+}
+
+function ReporterInner({ onSuccess, currentUser, isDarkMode }: ReporterProps) {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [imagePreview, setImagePreview] = useState<string | null>(null);
   const [isCapturing, setIsCapturing] = useState<boolean>(false);
@@ -212,6 +229,61 @@ export default function Reporter({ onSuccess, currentUser }: ReporterProps) {
   const [triageStep, setTriageStep] = useState<number>(0);
   const [editedDescription, setEditedDescription] = useState<string>("");
   const [language, setLanguage] = useState<string>("English");
+  
+  const [isLocationConfirmed, setIsLocationConfirmed] = useState<boolean>(false);
+  const [locationError, setLocationError] = useState<string | null>(null);
+  const autocompleteInputRef = useRef<HTMLInputElement>(null);
+  const [placeAutocomplete, setPlaceAutocomplete] = useState<google.maps.places.Autocomplete | null>(null);
+
+  const handleLocationChange = async (lat: number, lng: number) => {
+    setIsLocationConfirmed(false);
+    setLocationError(null);
+    setLocation(prev => ({ latitude: lat, longitude: lng, address: "Fetching address...", ward: prev?.ward }));
+    
+    if (geocodingLib) {
+      try {
+        const geocoder = new geocodingLib.Geocoder();
+        const result = await geocoder.geocode({ location: { lat, lng } });
+        if (result.results[0]) {
+           let address = result.results[0].formatted_address;
+           let ward = "";
+           const sublocality = result.results[0].address_components.find(c => c.types.includes("sublocality") || c.types.includes("neighborhood"));
+           if (sublocality) ward = sublocality.short_name;
+           else {
+             const locality = result.results[0].address_components.find(c => c.types.includes("locality"));
+             if (locality) ward = locality.short_name;
+           }
+           setLocation(prev => prev ? { ...prev, address, ward } : prev);
+        } else {
+           setLocation(prev => prev ? { ...prev, address: "Address not found for this location." } : prev);
+        }
+      } catch (e) {
+         console.error("Geocoding failed", e);
+         setLocation(prev => prev ? { ...prev, address: "Network error: couldn't fetch address." } : prev);
+      }
+    }
+  };
+
+  useEffect(() => {
+    if (!placesLib || !autocompleteInputRef.current) return;
+    const options = { fields: ["geometry", "name", "formatted_address"] };
+    setPlaceAutocomplete(new placesLib.Autocomplete(autocompleteInputRef.current, options));
+  }, [placesLib]);
+
+  useEffect(() => {
+    if (!placeAutocomplete) return;
+    const listener = placeAutocomplete.addListener("place_changed", () => {
+      const place = placeAutocomplete.getPlace();
+      if (place.geometry?.location) {
+        handleLocationChange(place.geometry.location.lat(), place.geometry.location.lng());
+      } else {
+        setLocationError("Please select a valid place from the dropdown or tap on the map.");
+      }
+    });
+    return () => {
+      google.maps.event.removeListener(listener);
+    };
+  }, [placeAutocomplete, geocodingLib]);
 
   const startRecording = async () => {
     try {
@@ -316,6 +388,10 @@ export default function Reporter({ onSuccess, currentUser }: ReporterProps) {
   const submitIssueToFirestore = async () => {
     if (!currentUser) return setTriageError("Please sign in first.");
     if (!location || !triageOutput) return;
+    if (!isLocationConfirmed) {
+      setLocationError("Please confirm the incident location on the map.");
+      return;
+    }
     setIsSubmitting(true);
     try {
       if (triageOutput.isCorroborated && triageOutput.targetIssueId) {
@@ -368,6 +444,8 @@ export default function Reporter({ onSuccess, currentUser }: ReporterProps) {
     setImagePreview(null);
     setTriageOutput(null);
     setTriageError(null);
+    setLocationError(null);
+    setIsLocationConfirmed(false);
     setIsDone(false);
     stopCamera();
   };
@@ -376,7 +454,7 @@ export default function Reporter({ onSuccess, currentUser }: ReporterProps) {
     <div className="glass-card rounded-3xl overflow-hidden max-w-2xl mx-auto mt-2">
       <div className="p-6 border-b border-[#E5E5E5] dark:border-gray-800 flex justify-between items-center bg-white/50 dark:bg-gray-900/50">
         <div>
-          <h2 className="text-xl font-bold tracking-tight text-[#1A1A1A] dark:text-white">
+          <h2 className="text-2xl font-display font-bold tracking-tight text-[#1A1A1A] dark:text-white">
             Civic Reporter
           </h2>
           <p className="text-xs text-[#717171] dark:text-gray-400 mt-1">
@@ -643,6 +721,74 @@ export default function Reporter({ onSuccess, currentUser }: ReporterProps) {
               />
             </div>
 
+            <div>
+              <div className="text-[10px] text-gray-500 dark:text-gray-400 uppercase font-bold mb-2 tracking-widest">
+                Confirm Location
+              </div>
+              <div className="flex flex-col gap-2 mb-3">
+                <input
+                  ref={autocompleteInputRef}
+                  type="text"
+                  placeholder="Search address or place"
+                  className="w-full text-xs text-gray-800 dark:text-gray-200 bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg p-2.5 outline-none focus:ring-2 focus:ring-primary/20"
+                />
+                <button
+                  onClick={requestLocation}
+                  className="text-[10px] self-start flex items-center gap-1.5 px-3 py-1.5 rounded-full font-bold uppercase tracking-widest cursor-pointer border border-[#E5E5E5] dark:border-gray-700 bg-white dark:bg-gray-800 text-[#4A4A4A] dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors"
+                >
+                  <MapPin className="w-3 h-3" /> Use my GPS
+                </button>
+              </div>
+              <div className="relative h-48 rounded-xl overflow-hidden border border-gray-200 dark:border-gray-700 mb-3 shadow-sm">
+                <GoogleMap
+                  defaultCenter={{ lat: location.latitude, lng: location.longitude }}
+                  defaultZoom={17}
+                  disableDefaultUI={true}
+                  mapId="DEMO_MAP_ID"
+                  colorScheme={isDarkMode ? "DARK" : "LIGHT"}
+                  onClick={(e) => {
+                    if (e.detail.latLng) {
+                      handleLocationChange(e.detail.latLng.lat, e.detail.latLng.lng);
+                    }
+                  }}
+                >
+                  <MapUpdater lat={location.latitude} lng={location.longitude} />
+                  <AdvancedMarker
+                    position={{ lat: location.latitude, lng: location.longitude }}
+                    draggable={true}
+                    onDragEnd={(e) => {
+                      if (e.latLng) {
+                        handleLocationChange(e.latLng.lat(), e.latLng.lng());
+                      }
+                    }}
+                  >
+                    <Pin background={"#2F6F6A"} borderColor={"#1C2B2A"} glyphColor={"#fff"} />
+                  </AdvancedMarker>
+                </GoogleMap>
+              </div>
+              
+              <div className="flex flex-col gap-3">
+                <p className="text-xs text-[#4A4A4A] dark:text-gray-300 bg-gray-100 dark:bg-gray-800 p-2.5 rounded-lg border border-gray-200 dark:border-gray-700 truncate">
+                  {location.address || "Fetching address..."}
+                </p>
+                <button
+                  onClick={() => setIsLocationConfirmed(true)}
+                  className={`w-full py-2.5 rounded-lg text-xs font-bold uppercase tracking-widest transition-colors ${
+                    isLocationConfirmed
+                      ? "bg-emerald-50 text-emerald-700 border border-emerald-200 dark:bg-emerald-900/30 dark:text-emerald-400 dark:border-emerald-800"
+                      : "bg-white text-gray-700 border border-gray-200 hover:bg-gray-50 dark:bg-gray-800 dark:text-gray-300 dark:border-gray-700 dark:hover:bg-gray-700 cursor-pointer"
+                  }`}
+                >
+                  {isLocationConfirmed ? "Location Confirmed ✓" : "Confirm Pin"}
+                </button>
+                {locationError && (
+                  <p className="text-xs text-red-600 dark:text-red-400 font-semibold flex items-center gap-1">
+                    <span aria-hidden="true">⚠️</span> Error: {locationError}
+                  </p>
+                )}
+              </div>
+            </div>
+
             <div className="pt-4 flex gap-3">
               <button
                 onClick={submitIssueToFirestore}
@@ -665,7 +811,7 @@ export default function Reporter({ onSuccess, currentUser }: ReporterProps) {
         {isDone && (
           <div className="py-12 text-center flex flex-col items-center">
             <Check className="w-10 h-10 text-[#10B981] mb-4" />
-            <h3 className="text-xl font-light tracking-tight text-[#1A1A1A] dark:text-white">
+            <h3 className="text-2xl font-display font-bold tracking-tight text-[#1A1A1A] dark:text-white">
               Report Logged
             </h3>
             <p className="text-[#10B981] text-xs font-bold uppercase tracking-widest mt-2">
@@ -675,5 +821,26 @@ export default function Reporter({ onSuccess, currentUser }: ReporterProps) {
         )}
       </div>
     </div>
+  );
+}
+
+import { APIProvider } from "@vis.gl/react-google-maps";
+
+const hasValidKey = Boolean(API_KEY) && API_KEY !== "YOUR_API_KEY";
+
+export default function Reporter(props: ReporterProps) {
+  return (
+    <APIProvider apiKey={API_KEY || ""} version="weekly" libraries={["places", "geocoding"]}>
+      {!hasValidKey ? (
+        <div className="flex flex-col items-center justify-center p-6 text-center bg-gray-50 dark:bg-gray-800 rounded-2xl h-full">
+          <p className="text-red-600 dark:text-red-400 font-bold mb-2">Maps API Key Missing</p>
+          <p className="text-xs text-gray-500">
+            Please add your GOOGLE_MAPS_PLATFORM_KEY to the environment secrets to enable location features.
+          </p>
+        </div>
+      ) : (
+        <ReporterInner {...props} />
+      )}
+    </APIProvider>
   );
 }

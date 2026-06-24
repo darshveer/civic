@@ -10,4 +10,3 @@ coverage/
 *.key
 *service-account*.json
 *.credentials.json
-AI_STUDIO_PROMPTS.md
