@@ -1,14 +1,99 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap');
 @import "tailwindcss";
 
+@custom-variant dark (&:where(.dark, .dark *));
+
 @theme {
-  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+
+  /* Base palette */
+  --color-base-50: var(--base-50);
+  --color-base-100: var(--base-100);
+  --color-base-200: var(--base-200);
+  --color-base-300: var(--base-300);
+  --color-base-800: var(--base-800);
+  --color-base-900: var(--base-900);
+  --color-base-950: var(--base-950);
+
+  /* Primary Accent: Teal */
+  --color-primary: var(--primary);
+  --color-primary-light: var(--primary-light);
+  --color-primary-dark: var(--primary-dark);
+
+  /* Semantic */
+  --color-semantic-success: var(--semantic-success);
+  --color-semantic-warning: var(--semantic-warning);
+  --color-semantic-danger: var(--semantic-danger);
+}
+
+@layer base {
+  :root {
+    --base-50: #FAFAFA;
+    --base-100: #F4F4F5;
+    --base-200: #E4E4E7;
+    --base-300: #D4D4D8;
+    --base-800: #27272A;
+    --base-900: #18181B;
+    --base-950: #09090B;
+    
+    --primary: #2F6F6A;
+    --primary-light: #E0F2F1;
+    --primary-dark: #1E4E4A;
+    
+    --semantic-success: #34D399; /* Calm green */
+    --semantic-warning: #FBBF24; /* Amber */
+    --semantic-danger:  #F87171; /* Coral-red */
+
+    --bg-color: var(--base-50);
+    --text-color: var(--base-950);
+    --border-color: var(--base-200);
+    --nav-bg: rgba(255, 255, 255, 0.75);
+    --nav-border: rgba(255, 255, 255, 0.4);
+    --card-bg: #FFFFFF;
+  }
+
+  .dark {
+    --bg-color: var(--base-950);
+    --text-color: var(--base-50);
+    --border-color: var(--base-800);
+    --nav-bg: rgba(24, 24, 27, 0.75);
+    --nav-border: rgba(255, 255, 255, 0.1);
+    --card-bg: var(--base-900);
+  }
 }
 
 body {
   font-family: var(--font-sans);
-  background-color: #F5F5F5;
-  color: #1A1A1A;
+  background-color: var(--bg-color);
+  color: var(--text-color);
   -webkit-font-smoothing: antialiased;
+  transition: background-color 0.3s ease, color 0.3s ease;
+}
+
+/* Glassmorphism utilities */
+.glass-nav {
+  background-color: var(--nav-bg);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--nav-border);
+  box-shadow: 0 4px 30px rgba(0, 0, 0, 0.1);
+}
+
+.glass-card {
+  background-color: var(--card-bg);
+  border: 1px solid var(--border-color);
+  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03);
+}
+
+.dark .glass-card {
+  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.2), 0 2px 4px -1px rgba(0, 0, 0, 0.1);
+}
+
+/* Hide scrollbar for cleanly rounded areas */
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
 }
