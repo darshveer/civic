@@ -1,0 +1,33 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="CIVIC logo">
+  <defs>
+    <linearGradient id="civicBg" x1="48" y1="32" x2="464" y2="480" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#3FA095"/>
+      <stop offset="0.55" stop-color="#2F6F6A"/>
+      <stop offset="1" stop-color="#274B66"/>
+    </linearGradient>
+    <linearGradient id="civicPin" x1="256" y1="100" x2="256" y2="424" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#E7F3F1"/>
+    </linearGradient>
+    <radialGradient id="civicGlow" cx="0.32" cy="0.26" r="0.85">
+      <stop stop-color="#FFFFFF" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="pinShadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="10" stdDeviation="16" flood-color="#0C2C2A" flood-opacity="0.28"/>
+    </filter>
+  </defs>
+
+  <!-- App-icon squircle -->
+  <rect width="512" height="512" rx="118" fill="url(#civicBg)"/>
+  <rect width="512" height="512" rx="118" fill="url(#civicGlow)"/>
+
+  <!-- Map pin = location / hyperlocal -->
+  <path filter="url(#pinShadow)"
+        d="M256 100 C188 100 133 155 133 223 C133 314 256 426 256 426 C256 426 379 314 379 223 C379 155 324 100 256 100 Z"
+        fill="url(#civicPin)"/>
+
+  <!-- Checkmark inside = issue resolved -->
+  <path d="M209 221 L243 256 L307 187"
+        stroke="#2F6F6A" stroke-width="30" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+</svg>
