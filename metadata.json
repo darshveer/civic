@@ -1,0 +1,6 @@
+{
+  "name": "C.I.V.I.C.",
+  "description": "Community Infrastructure Verification & Intelligent Clustering (C.I.V.I.C.) is a mobile-first civic infrastructure tracking platform driven by real-time citizen reporting and AI triage automation.",
+  "requestFramePermissions": ["camera", "geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
