@@ -37,29 +37,31 @@ import { CitizenProfile, CivicIssue } from '../types';
 // project), falling back to the AI Studio-injected firebase-applet-config.json.
 import firebaseConfigJson from '../../firebase-applet-config.json';
 
-const env = (process as unknown as { env?: Record<string, string | undefined> }).env || {};
+const env = typeof import.meta !== 'undefined' && (import.meta as any).env ? (import.meta as any).env : (process as unknown as { env?: Record<string, string | undefined> }).env || {};
 
 const firebaseConfig = {
-  apiKey: env.FIREBASE_API_KEY || firebaseConfigJson.apiKey,
+  apiKey: env.VITE_FIREBASE_API_KEY || env.FIREBASE_API_KEY || firebaseConfigJson.apiKey,
   authDomain:
-    env.FIREBASE_AUTH_DOMAIN ||
+    env.VITE_FIREBASE_AUTH_DOMAIN || env.FIREBASE_AUTH_DOMAIN ||
     firebaseConfigJson.authDomain ||
-    `${env.FIREBASE_PROJECT_ID || firebaseConfigJson.projectId}.firebaseapp.com`,
-  projectId: env.FIREBASE_PROJECT_ID || firebaseConfigJson.projectId,
-  storageBucket: env.FIREBASE_STORAGE_BUCKET || firebaseConfigJson.storageBucket,
+    `${env.VITE_FIREBASE_PROJECT_ID || env.FIREBASE_PROJECT_ID || firebaseConfigJson.projectId}.firebaseapp.com`,
+  projectId: env.VITE_FIREBASE_PROJECT_ID || env.FIREBASE_PROJECT_ID || firebaseConfigJson.projectId,
+  storageBucket: env.VITE_FIREBASE_STORAGE_BUCKET || env.FIREBASE_STORAGE_BUCKET || firebaseConfigJson.storageBucket,
   messagingSenderId:
-    env.FIREBASE_MESSAGING_SENDER_ID || firebaseConfigJson.messagingSenderId,
-  appId: env.FIREBASE_APP_ID || firebaseConfigJson.appId,
+    env.VITE_FIREBASE_MESSAGING_SENDER_ID || env.FIREBASE_MESSAGING_SENDER_ID || firebaseConfigJson.messagingSenderId,
+  appId: env.VITE_FIREBASE_APP_ID || env.FIREBASE_APP_ID || firebaseConfigJson.appId,
 };
 
 // Initialize Firebase App gracefully
 const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApp();
 
+const isCustomProject = !!(env.VITE_FIREBASE_PROJECT_ID || env.FIREBASE_PROJECT_ID);
+
 // Target the Firestore database id (env override → JSON → default).
 const db = initializeFirestore(
   app,
   {},
-  env.FIREBASE_DATABASE_ID || firebaseConfigJson.firestoreDatabaseId || '(default)',
+  env.VITE_FIREBASE_DATABASE_ID || env.FIREBASE_DATABASE_ID || (isCustomProject ? '(default)' : firebaseConfigJson.firestoreDatabaseId) || '(default)',
 );
 
 // Initialize Auth
@@ -242,7 +244,7 @@ export async function syncCitizenProfile(
       reportsCount: 0,
       role: 'citizen', // never created as staff; staff come from config/roles
     };
-    await setDoc(profileRef, newProfile);
+    await setDoc(profileRef, newProfile, { merge: true });
     return newProfile;
   } catch (err) {
     console.error('Error syncing citizen profile:', err);

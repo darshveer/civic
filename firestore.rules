@@ -54,7 +54,7 @@ service cloud.firestore {
       // Update only your own profile, and never your role/uid (no self-promotion).
       allow update: if isSignedIn()
         && citizenId == uid()
-        && request.resource.data.uid == resource.data.uid
+        && request.resource.data.get('uid', uid()) == resource.data.get('uid', uid())
         && request.resource.data.get('role', 'citizen') == resource.data.get('role', 'citizen');
       allow delete: if isCity(uid());
     }

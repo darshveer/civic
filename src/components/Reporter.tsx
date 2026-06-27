@@ -24,7 +24,7 @@ import {
 } from "firebase/firestore";
 import type { User } from "firebase/auth";
 import { TriageResult, CivicIssue, MetadataMode } from "../types";
-import { useMapsLibrary, Map as GoogleMap, AdvancedMarker, Pin, useMap } from "@vis.gl/react-google-maps";
+import { useMapsLibrary, Map as GoogleMap } from "@vis.gl/react-google-maps";
 
 interface ReporterProps {
   onSuccess: (newIssue: CivicIssue) => void;
@@ -94,16 +94,6 @@ const API_KEY =
   (import.meta as any).env?.VITE_GOOGLE_MAPS_PLATFORM_KEY ||
   (globalThis as any).GOOGLE_MAPS_PLATFORM_KEY ||
   "";
-
-function MapUpdater({ lat, lng }: { lat: number; lng: number }) {
-  const map = useMap("DEMO_MAP_ID");
-  useEffect(() => {
-    if (map) {
-      map.panTo({ lat, lng });
-    }
-  }, [map, lat, lng]);
-  return null;
-}
 
 function ReporterInner({ onSuccess, currentUser, isDarkMode }: ReporterProps) {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
@@ -225,24 +215,35 @@ function ReporterInner({ onSuccess, currentUser, isDarkMode }: ReporterProps) {
   }, []);
 
   useEffect(() => {
-    if (geocodingLib && location && !location.address) {
-      const fetchAddress = async () => {
-        const geocoder = new geocodingLib.Geocoder();
-        try {
-          const result = await geocoder.geocode({
-            location: { lat: location.latitude, lng: location.longitude },
-          });
-          if (result.results[0]) {
-            const geo = parseGeocode(result.results[0]);
-            setLocation((prev) => (prev ? { ...prev, ...geo } : prev));
-          }
-        } catch (e) {
-          console.error("Geocoding fetch failed", e);
-        }
-      };
-      fetchAddress();
+    if (geocodingLib && location && location.address === "Fetching address...") {
+      const timeoutId = setTimeout(() => {
+        const fetchAddress = async () => {
+          const geocoder = new geocodingLib.Geocoder();
+          geocoder.geocode(
+            { location: { lat: location.latitude, lng: location.longitude } },
+            (results, status) => {
+              if (status === "OK" && results && results[0]) {
+                const geo = parseGeocode(results[0]);
+                setLocation((prev) => (prev ? { ...prev, ...geo } : prev));
+              } else {
+                console.warn("Geocoder status:", status);
+                setLocation((prev) =>
+                  prev
+                    ? {
+                        ...prev,
+                        address: `${location.latitude.toFixed(5)}, ${location.longitude.toFixed(5)}`,
+                      }
+                    : prev,
+                );
+              }
+            }
+          );
+        };
+        fetchAddress();
+      }, 800); // 800ms debounce
+      return () => clearTimeout(timeoutId);
     }
-  }, [geocodingLib, location?.latitude, location?.longitude]);
+  }, [geocodingLib, location?.latitude, location?.longitude, location?.address]);
 
   const requestLocation = () => {
     if (!navigator.geolocation) {
@@ -254,28 +255,16 @@ function ReporterInner({ onSuccess, currentUser, isDarkMode }: ReporterProps) {
     setGeolocError(null);
     navigator.geolocation.getCurrentPosition(
       async (position) => {
-        let geo: ParsedGeo = { address: "", ward: "", city: "", state: "" };
-        if (geocodingLib) {
-          const geocoder = new geocodingLib.Geocoder();
-          try {
-            const result = await geocoder.geocode({
-              location: { lat: position.coords.latitude, lng: position.coords.longitude },
-            });
-            if (result.results[0]) geo = parseGeocode(result.results[0]);
-          } catch (e) {
-            console.error("Geocoding failed", e);
-          }
-        }
         setLocation({
           latitude: position.coords.latitude,
           longitude: position.coords.longitude,
-          ...geo,
+          address: "Fetching address...",
         });
         setLocatingState("success");
       },
       (error) => {
         setLocatingState("failed");
-        setLocation({ latitude: 12.9716, longitude: 77.5946 });
+        setLocation({ latitude: 12.9716, longitude: 77.5946, address: "Fetching address..." });
         setGeolocError(
           "Location access denied. Defaulting to Bangalore city center.",
         );
@@ -356,9 +345,9 @@ function ReporterInner({ onSuccess, currentUser, isDarkMode }: ReporterProps) {
       if (exif) {
         setMetadataMode("Historical-EXIF");
         setCaptureTimestamp(exif.capturedAt);
-        // Setting location WITHOUT an address lets the geocoding effect reverse-
+        // Setting address to "Fetching address..." lets the geocoding effect reverse-
         // geocode the EXIF point into ward/city/state.
-        setLocation({ latitude: exif.latitude, longitude: exif.longitude });
+        setLocation({ latitude: exif.latitude, longitude: exif.longitude, address: "Fetching address..." });
         setLocatingState("success");
         setGeolocError(null);
       } else {
@@ -399,13 +388,13 @@ function ReporterInner({ onSuccess, currentUser, isDarkMode }: ReporterProps) {
           setLocation((prev) => (prev ? { ...prev, ...geo } : prev));
         } else {
           setLocation((prev) =>
-            prev ? { ...prev, address: "Address not found for this location." } : prev,
+            prev ? { ...prev, address: `${lat.toFixed(5)}, ${lng.toFixed(5)} (Unknown Address)` } : prev,
           );
         }
       } catch (e) {
-        console.error("Geocoding failed", e);
+        console.error("Geocoding failed. Check if Geocoding API is enabled on your API key.", e);
         setLocation((prev) =>
-          prev ? { ...prev, address: "Network error: couldn't fetch address." } : prev,
+          prev ? { ...prev, address: `${lat.toFixed(5)}, ${lng.toFixed(5)} (Unknown Address)` } : prev,
         );
       }
     }
@@ -413,9 +402,16 @@ function ReporterInner({ onSuccess, currentUser, isDarkMode }: ReporterProps) {
 
   useEffect(() => {
     if (!placesLib || !autocompleteInputRef.current) return;
-    const options = { fields: ["geometry", "name", "formatted_address"] };
-    setPlaceAutocomplete(new placesLib.Autocomplete(autocompleteInputRef.current, options));
-  }, [placesLib]);
+    // Prevent multiple initializations
+    if (placeAutocomplete) return;
+    
+    const options = { fields: ["geometry", "name", "formatted_address"], types: ["geocode"] };
+    const autocomplete = new placesLib.Autocomplete(autocompleteInputRef.current, options);
+    setPlaceAutocomplete(autocomplete);
+    
+    // Cleanup is tricky with Autocomplete, but we can clear the listener if needed.
+    // The main thing is avoiding creating a new Autocomplete object on every re-render.
+  }, [placesLib, autocompleteInputRef, placeAutocomplete]);
 
   useEffect(() => {
     if (!placeAutocomplete) return;
@@ -423,6 +419,9 @@ function ReporterInner({ onSuccess, currentUser, isDarkMode }: ReporterProps) {
       const place = placeAutocomplete.getPlace();
       if (place.geometry?.location) {
         handleLocationChange(place.geometry.location.lat(), place.geometry.location.lng());
+        if (autocompleteInputRef.current && place.formatted_address) {
+          autocompleteInputRef.current.value = place.formatted_address;
+        }
       } else {
         setLocationError("Please select a valid place from the dropdown or tap on the map.");
       }
@@ -1111,30 +1110,24 @@ function ReporterInner({ onSuccess, currentUser, isDarkMode }: ReporterProps) {
               </div>
               <div className="relative h-48 rounded-xl overflow-hidden border border-gray-200 dark:border-gray-700 mb-3 shadow-sm">
                 <GoogleMap
-                  defaultCenter={{ lat: location.latitude, lng: location.longitude }}
+                  center={{ lat: location.latitude, lng: location.longitude }}
                   defaultZoom={17}
                   disableDefaultUI={true}
                   mapId="DEMO_MAP_ID"
                   colorScheme={isDarkMode ? "DARK" : "LIGHT"}
-                  onClick={(e) => {
-                    if (e.detail.latLng) {
-                      handleLocationChange(e.detail.latLng.lat, e.detail.latLng.lng);
+                  onCameraChanged={(e) => {
+                    const center = e.detail.center;
+                    if (center && (Math.abs(center.lat - location.latitude) > 0.0001 || Math.abs(center.lng - location.longitude) > 0.0001)) {
+                      // We don't call handleLocationChange immediately to avoid spamming geocoder.
+                      // Instead, we just update the coordinates silently. The geocoding effect will catch it.
+                      setLocation(prev => prev ? { ...prev, latitude: center.lat, longitude: center.lng, address: "Fetching address..." } : prev);
                     }
                   }}
                 >
-                  <MapUpdater lat={location.latitude} lng={location.longitude} />
-                  <AdvancedMarker
-                    position={{ lat: location.latitude, lng: location.longitude }}
-                    draggable={true}
-                    onDragEnd={(e) => {
-                      if (e.latLng) {
-                        handleLocationChange(e.latLng.lat(), e.latLng.lng());
-                      }
-                    }}
-                  >
-                    <Pin background={"#2F6F6A"} borderColor={"#1C2B2A"} glyphColor={"#fff"} />
-                  </AdvancedMarker>
                 </GoogleMap>
+                <div className="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-[100%] pointer-events-none drop-shadow-md">
+                  <MapPin className="w-8 h-8 text-[#2F6F6A] fill-white" />
+                </div>
               </div>
               
               <div className="flex flex-col gap-3">
@@ -1203,7 +1196,7 @@ const hasValidKey = Boolean(API_KEY) && API_KEY !== "YOUR_API_KEY";
 
 export default function Reporter(props: ReporterProps) {
   return (
-    <APIProvider apiKey={API_KEY || ""} version="weekly" libraries={["places", "geocoding"]}>
+    <APIProvider apiKey={API_KEY || ""} libraries={["places"]}>
       {!hasValidKey ? (
         <div className="flex flex-col items-center justify-center p-6 text-center bg-gray-50 dark:bg-gray-800 rounded-2xl h-full">
           <p className="text-red-600 dark:text-red-400 font-bold mb-2">Maps API Key Missing</p>

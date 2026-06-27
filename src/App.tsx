@@ -269,39 +269,6 @@ export default function App() {
   const scopedIssues = isStaff ? issuesInScope(scope, issues) : issues;
 
   useEffect(() => {
-    // If a sandbox session was stored previously, initialize it right away
-    const initSandbox = async () => {
-      if (localStorage.getItem("civic_sandbox_session") === "true") {
-        const mockUser = {
-          uid: "sandbox-dev-citizen",
-          displayName: "Sandbox Developer",
-          email: "developer@civic.local",
-          photoURL:
-            "https://api.dicebear.com/7.x/bottts/svg?seed=sandbox-dev-citizen",
-        } as unknown as User;
-        setUser(mockUser);
-        try {
-          const userProfile = await syncCitizenProfile(mockUser, "citizen");
-          const s = await applyScope(mockUser.uid);
-          setProfile({ ...userProfile, role: s.role });
-          if (s.role === "staff") setActiveTab("map");
-        } catch (err) {
-          setProfile({
-            uid: "sandbox-dev-citizen",
-            displayName: "Sandbox Developer",
-            photoURL:
-              "https://api.dicebear.com/7.x/bottts/svg?seed=sandbox-dev-citizen",
-            joinedAt: Date.now(),
-            impactPoints: 120,
-            civicRank: "Neighbourhood Champion",
-            reportsCount: 4,
-            role: "citizen",
-          });
-        }
-      }
-    };
-    initSandbox();
-
     // Complete a Google redirect sign-in (used when the popup is blocked).
     getRedirectResult(auth).catch((e) => {
       console.warn("Google redirect sign-in did not complete:", e?.message || e);
@@ -310,23 +277,22 @@ export default function App() {
     const unsubscribeAuth = onAuthStateChanged(auth, async (firebaseUser) => {
       setAuthLoading(true);
       if (firebaseUser) {
-        localStorage.removeItem("civic_sandbox_session");
-        setUser(firebaseUser);
         try {
           const userProfile = await syncCitizenProfile(firebaseUser);
           const s = await applyScope(firebaseUser.uid);
+          setUser(firebaseUser);
           setProfile({ ...userProfile, role: s.role });
           if (s.role === "staff") setActiveTab("map");
-        } catch (err) {}
+        } catch (err: any) {
+          console.error("Profile sync failed:", err);
+          setAuthError("Profile sync failed: " + (err?.message || err));
+          setUser(null);
+          setProfile(null);
+          try { await signOut(auth); } catch (e) {}
+        }
       } else {
-        setUser((prev) => {
-          if (prev && prev.uid === "sandbox-dev-citizen") return prev;
-          return null;
-        });
-        setProfile((prev) => {
-          if (prev && prev.uid === "sandbox-dev-citizen") return prev;
-          return null;
-        });
+        setUser(null);
+        setProfile(null);
       }
       setAuthLoading(false);
     });
@@ -383,8 +349,16 @@ export default function App() {
     try {
       // onAuthStateChanged resolves profile + authoritative scope + landing tab.
       await signInWithEmailAndPassword(auth, email, password);
-    } catch (err) {
-      setAuthError(err instanceof Error ? err.message : "Sign in failed.");
+    } catch (err: any) {
+      if (err.code === "auth/invalid-credential" || err.code === "auth/user-not-found" || err.code === "auth/wrong-password") {
+        setAuthError("Username or password is incorrect.");
+      } else if (err.code === "auth/operation-not-allowed") {
+        setAuthError(
+          "Email sign-up isn't enabled for this app yet. Admin: enable Email/Password in Firebase → Authentication → Sign-in method.",
+        );
+      } else {
+        setAuthError(err instanceof Error ? err.message : "Sign in failed.");
+      }
     } finally {
       setAuthLoading(false);
     }
@@ -441,10 +415,35 @@ export default function App() {
         throw new Error(data.error || "Verification failed.");
       // Email confirmed — now create the account.
       const cred = await createUserWithEmailAndPassword(auth, email, password);
+      const finalName = name || email.split("@")[0];
+      const finalPhoto = `https://api.dicebear.com/7.x/bottts/svg?seed=${cred.user.uid}`;
       await updateProfile(cred.user, {
-        displayName: name || email.split("@")[0],
-        photoURL: `https://api.dicebear.com/7.x/bottts/svg?seed=${cred.user.uid}`,
+        displayName: finalName,
+        photoURL: finalPhoto,
       });
+      
+      // onAuthStateChanged fires before updateProfile completes, so we must
+      // patch the created document to ensure the name isn't lost.
+      try {
+        const { doc, setDoc } = await import("firebase/firestore");
+        await setDoc(doc(db, "citizens", cred.user.uid), {
+          uid: cred.user.uid,
+          displayName: finalName,
+          photoURL: finalPhoto,
+          role: "citizen",
+          joinedAt: Date.now(),
+          impactPoints: 20,
+          civicRank: "Civic Novice",
+          reportsCount: 0
+        }, { merge: true });
+        
+        // Also update local state so UI reflects the name immediately without a refresh
+        setProfile(prev => prev ? { ...prev, displayName: finalName, photoURL: finalPhoto } : null);
+        setUser({ ...cred.user, displayName: finalName, photoURL: finalPhoto } as any);
+      } catch (e) {
+        console.error("Failed to patch new user profile:", e);
+      }
+
       setOtpStep("form");
       setOtpCode("");
       // onAuthStateChanged finalises profile + scope.
@@ -502,7 +501,6 @@ export default function App() {
   };
 
   const handleSignOut = async () => {
-    localStorage.removeItem("civic_sandbox_session");
     setUser(null);
     setProfile(null);
     setActiveTab("reporter");
@@ -519,46 +517,39 @@ export default function App() {
     setAuthLoading(true);
     try {
       const cred = await signInAnonymously(auth);
+      const finalName = `Hero_${Math.floor(1000 + Math.random() * 9000)}`;
+      const finalPhoto = `https://api.dicebear.com/7.x/bottts/svg?seed=${cred.user.uid}`;
       await updateProfile(cred.user, {
-        displayName: `Hero_${Math.floor(1000 + Math.random() * 9000)}`,
-        photoURL: `https://api.dicebear.com/7.x/bottts/svg?seed=${cred.user.uid}`,
+        displayName: finalName,
+        photoURL: finalPhoto,
       });
-      // onAuthStateChanged finalises profile + scope.
-    } catch (err) {
-      console.warn(
-        "Anonymous sign-in failed. Activating local sandbox resilient developer access...",
-        err,
-      );
-      // Fallback: If Firebase Anonymous sign-in is disabled, instantly fallback to sandbox developer flow
+      
       try {
-        localStorage.setItem("civic_sandbox_session", "true");
-        const mockUser = {
-          uid: "sandbox-dev-citizen",
-          displayName: "Sandbox Developer",
-          email: "developer@civic.local",
-          photoURL:
-            "https://api.dicebear.com/7.x/bottts/svg?seed=sandbox-dev-citizen",
-        } as unknown as User;
-        setUser(mockUser);
-        const userProfile = await syncCitizenProfile(mockUser, "citizen");
-        const s = await applyScope(mockUser.uid);
-        setProfile({ ...userProfile, role: s.role });
-        if (s.role === "staff") setActiveTab("map");
-      } catch (fallbackErr) {
-        // Even if Firestore fails, give them a simulated mock profile.
-        const s = await applyScope("sandbox-dev-citizen");
-        setProfile({
-          uid: "sandbox-dev-citizen",
-          displayName: "Sandbox Developer",
-          photoURL:
-            "https://api.dicebear.com/7.x/bottts/svg?seed=sandbox-dev-citizen",
+        const { doc, setDoc } = await import("firebase/firestore");
+        await setDoc(doc(db, "citizens", cred.user.uid), {
+          uid: cred.user.uid,
+          displayName: finalName,
+          photoURL: finalPhoto,
+          role: "citizen",
           joinedAt: Date.now(),
           impactPoints: 20,
           civicRank: "Civic Novice",
-          reportsCount: 0,
-          role: s.role,
-        });
-        if (s.role === "staff") setActiveTab("map");
+          reportsCount: 0
+        }, { merge: true });
+        
+        setProfile(prev => prev ? { ...prev, displayName: finalName, photoURL: finalPhoto } : null);
+        setUser({ ...cred.user, displayName: finalName, photoURL: finalPhoto } as any);
+      } catch (e) {
+        console.error("Failed to patch guest profile:", e);
+      }
+      // onAuthStateChanged finalises profile + scope.
+    } catch (err: any) {
+      if (err.code === "auth/operation-not-allowed") {
+        setAuthError(
+          "Guest sign-in isn't enabled. Admin: enable Anonymous sign-in in Firebase → Authentication → Sign-in method.",
+        );
+      } else {
+        setAuthError("Failed to sign in as guest.");
       }
     } finally {
       setAuthLoading(false);
