@@ -13,10 +13,17 @@ import {
   ChevronUp,
   ChevronDown,
   MessageCircle,
+  FileText,
+  PenLine,
+  ShieldCheck,
 } from "lucide-react";
-import { db, rewardImpactPoints } from "../lib/firebase";
-import { doc, updateDoc, increment } from "firebase/firestore";
-import { CivicIssue } from "../types";
+import { db, toggleUpvote, resolveIssue, corroborateAndApprove } from "../lib/firebase";
+import { doc, updateDoc, arrayUnion } from "firebase/firestore";
+import type { User } from "firebase/auth";
+import { CivicIssue, UserScope } from "../types";
+import { canActOnIssue } from "../lib/roles";
+import { moderateComment } from "../lib/profanity";
+import { petitionEligible, PETITION_THRESHOLD } from "../lib/civic";
 import {
   APIProvider,
   Map as GoogleMap,
@@ -32,7 +39,8 @@ import { MarkerClusterer } from "@googlemaps/markerclusterer";
 interface CommandMapProps {
   issues: CivicIssue[];
   onSelectIssue?: (issue: CivicIssue) => void;
-  currentUser: any;
+  currentUser: User | null;
+  scope: UserScope;
   selectedIssueFromParent?: CivicIssue | null;
   isDarkMode?: boolean;
 }
@@ -81,7 +89,7 @@ function PlacesContext({ location }: { location: { lat: number; lng: number } })
   );
 }
 
-function CommentsSection({ selectedIssue, currentUser }: { selectedIssue: CivicIssue, currentUser: any }) {
+function CommentsSection({ selectedIssue, currentUser }: { selectedIssue: CivicIssue, currentUser: User | null }) {
   const [newComment, setNewComment] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -89,6 +97,12 @@ function CommentsSection({ selectedIssue, currentUser }: { selectedIssue: CivicI
   const handleAddComment = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newComment.trim() || !currentUser) return;
+    // Moderate: reject hate speech/slurs outright, mask ordinary profanity.
+    const moderation = moderateComment(newComment.trim());
+    if (!moderation.ok) {
+      setErrorMsg(moderation.reason || "Please keep comments respectful.");
+      return;
+    }
     setIsSubmitting(true);
     setErrorMsg(null);
     try {
@@ -97,14 +111,13 @@ function CommentsSection({ selectedIssue, currentUser }: { selectedIssue: CivicI
         id: Math.random().toString(36).substring(2, 9),
         authorUid: currentUser.uid,
         authorName: currentUser.displayName || "Civic Hero",
-        text: newComment.trim(),
+        text: moderation.text,
         createdAt: Date.now(),
       };
       
-      const updatedComments = [...(selectedIssue.comments || []), comment];
-      await updateDoc(issueRef, { comments: updatedComments });
-      // Note: In real app, we should use arrayUnion but we do it this way to instantly update the UI if needed
-      // Actually, since issues are passed down from onSnapshot in App.tsx, the prop will update shortly.
+      // arrayUnion appends atomically so concurrent commenters don't clobber
+      // each other (and only the `comments` field changes, satisfying the rules).
+      await updateDoc(issueRef, { comments: arrayUnion(comment) });
       setNewComment("");
     } catch (err: any) {
       console.error("Failed to add comment:", err);
@@ -152,6 +165,131 @@ function CommentsSection({ selectedIssue, currentUser }: { selectedIssue: CivicI
             Post
           </button>
         </form>
+      )}
+    </div>
+  );
+}
+
+function PetitionSection({
+  issue,
+  currentUser,
+}: {
+  issue: CivicIssue;
+  currentUser: User | null;
+}) {
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const support = (issue.upvotesCount || 0) + ((issue.duplicateCount || 1) - 1);
+  const petition = issue.petition;
+  const signed = Boolean(
+    petition?.signatures?.includes(currentUser?.uid || ""),
+  );
+
+  const draft = async () => {
+    if (!currentUser) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/draft-petition", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ issue }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.petition) throw new Error(data.error || "Draft failed.");
+      const newPetition = {
+        ...data.petition,
+        draftedAt: Date.now(),
+        draftedByUid: currentUser.uid,
+        signatures: [currentUser.uid],
+      };
+      await updateDoc(doc(db, "issues", issue.id), { petition: newPetition });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Couldn't draft the petition.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const sign = async () => {
+    if (!currentUser) return;
+    setError(null);
+    try {
+      await updateDoc(doc(db, "issues", issue.id), {
+        "petition.signatures": arrayUnion(currentUser.uid),
+      });
+    } catch {
+      setError("Couldn't add your signature.");
+    }
+  };
+
+  return (
+    <div className="mt-6 border-t border-gray-100 dark:border-gray-800 pt-6">
+      <h4 className="text-xs font-bold text-rose-600 dark:text-rose-400 uppercase tracking-widest mb-4 flex items-center gap-2">
+        <FileText className="w-4 h-4" />
+        Civic Petition
+      </h4>
+
+      {petition ? (
+        <div className="bg-rose-50 dark:bg-rose-900/20 border border-rose-200 dark:border-rose-800 rounded-2xl p-4 space-y-3">
+          <p className="font-bold text-gray-900 dark:text-white text-sm">
+            {petition.title}
+          </p>
+          <p className="text-[10px] uppercase tracking-wider font-bold text-rose-600 dark:text-rose-400">
+            To: {petition.addressedTo}
+          </p>
+          <p className="text-xs text-gray-600 dark:text-gray-300 whitespace-pre-line leading-relaxed max-h-40 overflow-y-auto no-scrollbar">
+            {petition.body}
+          </p>
+          <div className="flex items-center justify-between pt-1">
+            <span className="text-xs font-bold text-gray-700 dark:text-gray-300">
+              {petition.signatures?.length || 0} signature
+              {(petition.signatures?.length || 0) === 1 ? "" : "s"}
+            </span>
+            {signed ? (
+              <span className="text-xs font-bold text-emerald-600 dark:text-emerald-400 flex items-center gap-1">
+                <CheckCircle className="w-4 h-4" /> Signed
+              </span>
+            ) : (
+              <button
+                onClick={sign}
+                disabled={!currentUser}
+                className="bg-rose-600 hover:bg-rose-700 text-white text-[10px] font-bold uppercase tracking-widest px-4 py-2 rounded-full flex items-center gap-1.5 transition-colors cursor-pointer disabled:opacity-50"
+              >
+                <PenLine className="w-3.5 h-3.5" /> Sign petition
+              </button>
+            )}
+          </div>
+        </div>
+      ) : (
+        <div className="bg-rose-50 dark:bg-rose-900/20 border border-rose-200 dark:border-rose-800 rounded-2xl p-4">
+          <p className="text-xs text-gray-600 dark:text-gray-300 mb-3 leading-relaxed">
+            This issue has strong community backing ({support} of{" "}
+            {PETITION_THRESHOLD}+). An AI advocacy agent can draft a formal
+            petition to {issue.recommendedDepartment || "the department"} that
+            residents can sign.
+          </p>
+          <button
+            onClick={draft}
+            disabled={loading || !currentUser}
+            className="bg-rose-600 hover:bg-rose-700 text-white text-[10px] font-bold uppercase tracking-widest px-4 py-2.5 rounded-full transition-colors cursor-pointer disabled:opacity-50 flex items-center gap-2"
+          >
+            {loading ? (
+              <img
+                src="/civic-logo.svg"
+                className="w-4 h-4 animate-pulse brightness-0 invert"
+                alt=""
+              />
+            ) : (
+              <FileText className="w-3.5 h-3.5" />
+            )}
+            {loading ? "Drafting petition…" : "Draft community petition"}
+          </button>
+        </div>
+      )}
+
+      {error && (
+        <p className="text-xs text-red-600 dark:text-red-400 mt-2">{error}</p>
       )}
     </div>
   );
@@ -209,9 +347,19 @@ function MapInner({
     <>
       {issues.map((issue) => {
         const isSelected = selectedIssue?.id === issue.id;
+        // Trust Engine pin colours take precedence over raw severity so the map
+        // communicates verification state at a glance:
+        //   Staff Verified  → green (high-priority, officially confirmed)
+        //   Flagged for Review → danger red (suspected fraud)
+        // Otherwise fall back to the severity heat scale.
         let bgBg = "var(--primary)";
-        if (issue.severityScore >= 8) bgBg = "var(--semantic-danger)";
+        if (issue.status === "Staff Verified") bgBg = "#16A34A"; // green-600
+        else if (issue.status === "Flagged for Review")
+          bgBg = "var(--semantic-danger)";
+        else if (issue.severityScore >= 8) bgBg = "var(--semantic-danger)";
         else if (issue.severityScore >= 5) bgBg = "var(--semantic-warning)";
+
+        const isStaffVerified = issue.status === "Staff Verified";
 
         return (
           <AdvancedMarker
@@ -220,14 +368,16 @@ function MapInner({
             position={{ lat: issue.latitude, lng: issue.longitude }}
             title={issue.category}
             onClick={() => onMarkerClick(issue)}
-            zIndex={isSelected ? 40 : 20}
+            zIndex={isSelected ? 40 : isStaffVerified ? 35 : 20}
           >
             <div
               className={`relative ${isSelected ? "scale-125" : "scale-100"} transition-transform duration-300`}
             >
-              {issue.severityScore >= 8 && !isSelected && (
-                <div className="absolute inset-0 rounded-full bg-red-500 animate-ping opacity-75"></div>
-              )}
+              {issue.severityScore >= 8 &&
+                !isSelected &&
+                !isStaffVerified && (
+                  <div className="absolute inset-0 rounded-full bg-red-500 animate-ping opacity-75"></div>
+                )}
               <Pin
                 background={bgBg}
                 glyphColor="#fff"
@@ -246,13 +396,20 @@ export default function CommandMap({
   issues,
   onSelectIssue,
   currentUser,
+  scope,
   selectedIssueFromParent,
   isDarkMode,
 }: CommandMapProps) {
+  const isStaff = scope.role === "staff";
   const [selectedIssue, setSelectedIssue] = useState<CivicIssue | null>(null);
   const [filterCategory, setFilterCategory] = useState<string>("All");
+  const [cityFilter, setCityFilter] = useState<string>("All");
+  const [wardFilter, setWardFilter] = useState<string>("All");
+  const [showLocationFilter, setShowLocationFilter] = useState(false);
   const [isSheetExpanded, setIsSheetExpanded] = useState(false);
   const [isImageModalOpen, setIsImageModalOpen] = useState(false);
+  const [upvoteError, setUpvoteError] = useState<string | null>(null);
+  const [approvingId, setApprovingId] = useState<string | null>(null);
   const [resolvingIssue, setResolvingIssue] = useState<CivicIssue | null>(null);
   const [isVerifying, setIsVerifying] = useState(false);
   const [verificationResult, setVerificationResult] = useState<{
@@ -276,6 +433,14 @@ export default function CommandMap({
       });
     }
   }, [selectedIssueFromParent]);
+
+  // Keep the open sheet in sync with the live snapshot (upvotes, status, etc.)
+  // so we never need fragile optimistic mutations.
+  useEffect(() => {
+    setSelectedIssue((prev) =>
+      prev ? issues.find((i) => i.id === prev.id) ?? prev : prev,
+    );
+  }, [issues]);
 
   const handleMarkerClick = (issue: CivicIssue) => {
     setSelectedIssue(issue);
@@ -318,41 +483,28 @@ export default function CommandMap({
 
   const upvoteIssue = async (issueId: string, e: React.MouseEvent) => {
     e.stopPropagation();
+    setUpvoteError(null);
+    if (!currentUser) return;
+    const issue = issues.find((i) => i.id === issueId);
+    if (!issue) return;
+
+    // Logical guards: municipal staff don't upvote (it's their queue), and
+    // nobody upvotes their own report.
+    if (isStaff) {
+      setUpvoteError("Municipal staff can't upvote community reports.");
+      return;
+    }
+    if (issue.reportedByUid === currentUser.uid) {
+      setUpvoteError("You can't upvote your own report.");
+      return;
+    }
+
+    const wasUpvoting = !(issue.upvotedBy || []).includes(currentUser.uid);
     try {
-      if (!currentUser) return;
-      const issue = issues.find((i) => i.id === issueId);
-      if (!issue) return;
-
-      const upvotedByList = issue.upvotedBy || [];
-      const hasUpvoted = upvotedByList.includes(currentUser.uid);
-
-      const issueRef = doc(db, "issues", issueId);
-      if (hasUpvoted) {
-        const nextList = upvotedByList.filter((id) => id !== currentUser.uid);
-        await updateDoc(issueRef, {
-          upvotesCount: increment(-1),
-          upvotedBy: nextList,
-        });
-        if (selectedIssue && selectedIssue.id === issueId) {
-          setSelectedIssue({
-            ...selectedIssue,
-            upvotesCount: Math.max(0, (selectedIssue.upvotesCount || 0) - 1),
-            upvotedBy: nextList,
-          });
-        }
-      } else {
-        const nextList = [...upvotedByList, currentUser.uid];
-        await updateDoc(issueRef, {
-          upvotesCount: increment(1),
-          upvotedBy: nextList,
-        });
-        if (selectedIssue && selectedIssue.id === issueId) {
-          setSelectedIssue({
-            ...selectedIssue,
-            upvotesCount: (selectedIssue.upvotesCount || 0) + 1,
-            upvotedBy: nextList,
-          });
-        }
+      // Atomic toggle; the live onSnapshot in App.tsx updates the UI, so no
+      // optimistic local mutation is needed (and nothing to roll back).
+      const result = await toggleUpvote(issueId, currentUser.uid);
+      if (result.upvoted && wasUpvoting) {
         confetti({
           particleCount: 50,
           spread: 60,
@@ -360,12 +512,32 @@ export default function CommandMap({
           colors: ["#4F46E5", "#3B82F6"],
         });
       }
-    } catch (err) {}
+    } catch (err) {
+      setUpvoteError(
+        err instanceof Error ? err.message : "Couldn't register your vote.",
+      );
+    }
   };
 
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0] && resolvingIssue) {
       const file = e.target.files[0];
+      // Guard: a staff member must be in scope for this issue, and it must not
+      // already be resolved. (Firestore rules enforce the same.)
+      if (!currentUser || !canActOnIssue(scope, resolvingIssue)) {
+        setVerificationResult({
+          isResolved: false,
+          confidence: 0,
+          notes: "You are not authorised to resolve issues in this area.",
+        });
+        e.target.value = "";
+        return;
+      }
+      if (resolvingIssue.status === "Resolved" || isVerifying) {
+        e.target.value = "";
+        return;
+      }
+      const file0 = file;
       const reader = new FileReader();
 
       reader.onload = async () => {
@@ -380,35 +552,40 @@ export default function CommandMap({
             body: JSON.stringify({
               beforeImage: resolvingIssue.imageUrl,
               afterImage: afterImageBase64,
-              mimeType: file.type || "image/jpeg",
+              mimeType: file0.type || "image/jpeg",
               category: resolvingIssue.category,
             }),
           });
 
           const data = await response.json();
-          if (!response.ok) throw new Error(data.error);
+          if (!response.ok) throw new Error(data.error || "Verification failed.");
 
           setVerificationResult(data.verification);
 
           if (data.verification.isResolved) {
-            const issueRef = doc(db, "issues", resolvingIssue.id);
-            await updateDoc(issueRef, {
-              status: "Resolved",
-              resolvedImageUrl: afterImageBase64,
-              resolutionConfidence: data.verification.confidence,
-              resolutionNotes: data.verification.notes,
-            });
-            await rewardImpactPoints(resolvingIssue.reportedByUid, 50);
-            const resolvedObj = {
-              ...resolvingIssue,
-              status: "Resolved" as const,
-              resolvedImageUrl: afterImageBase64,
-              resolutionConfidence: data.verification.confidence,
-              resolutionNotes: data.verification.notes,
-            };
-            setSelectedIssue(resolvedObj);
-            if (onSelectIssue) onSelectIssue(resolvedObj);
-            fireConfetti();
+            // Idempotent: the transaction flips status once; rapid re-clicks
+            // and points double-awards are impossible.
+            const didResolve = await resolveIssue(
+              resolvingIssue.id,
+              currentUser.uid,
+              {
+                resolvedImageUrl: afterImageBase64,
+                resolutionConfidence: data.verification.confidence,
+                resolutionNotes: data.verification.notes,
+              },
+            );
+            if (didResolve) {
+              const resolvedObj = {
+                ...resolvingIssue,
+                status: "Resolved" as const,
+                resolvedImageUrl: afterImageBase64,
+                resolutionConfidence: data.verification.confidence,
+                resolutionNotes: data.verification.notes,
+              };
+              setSelectedIssue(resolvedObj);
+              if (onSelectIssue) onSelectIssue(resolvedObj);
+              fireConfetti();
+            }
 
             setTimeout(() => {
               setResolvingIssue(null);
@@ -416,9 +593,15 @@ export default function CommandMap({
             }, 3000);
           }
         } catch (err) {
-          console.error(err);
+          setVerificationResult({
+            isResolved: false,
+            confidence: 0,
+            notes:
+              err instanceof Error ? err.message : "Could not verify the fix.",
+          });
         } finally {
           setIsVerifying(false);
+          e.target.value = "";
         }
       };
       reader.readAsDataURL(file);
@@ -427,14 +610,45 @@ export default function CommandMap({
 
   const startResolution = (issue: CivicIssue, e: React.MouseEvent) => {
     e.stopPropagation();
+    if (issue.status === "Resolved" || isVerifying) return;
     setResolvingIssue(issue);
     if (fileInputRef.current) fileInputRef.current.click();
   };
 
-  const filteredIssues =
-    filterCategory === "All"
-      ? issues
-      : issues.filter((i) => i.category === filterCategory);
+  // RULE B — Official Staff Override: promote straight to "Staff Verified".
+  const handleApprove = async (issue: CivicIssue, e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!currentUser) return;
+    setApprovingId(issue.id);
+    setUpvoteError(null);
+    try {
+      await corroborateAndApprove(issue.id, currentUser.uid);
+    } catch (err) {
+      setUpvoteError(
+        err instanceof Error ? err.message : "Approval failed. Try again.",
+      );
+    } finally {
+      setApprovingId(null);
+    }
+  };
+
+  // City → Ward location filter (cascading).
+  const uniqueSorted = (vals: (string | undefined)[]) =>
+    Array.from(new Set(vals.filter((v): v is string => Boolean(v)))).sort();
+  const cityOptions = uniqueSorted(issues.map((i) => i.city));
+  const wardOptions = uniqueSorted(
+    issues
+      .filter((i) => cityFilter === "All" || i.city === cityFilter)
+      .map((i) => i.ward),
+  );
+  const locationFilterActive = cityFilter !== "All" || wardFilter !== "All";
+
+  const filteredIssues = issues.filter(
+    (i) =>
+      (filterCategory === "All" || i.category === filterCategory) &&
+      (cityFilter === "All" || i.city === cityFilter) &&
+      (wardFilter === "All" || i.ward === wardFilter),
+  );
 
   return (
     <div className="absolute inset-0 bg-gray-100 dark:bg-gray-900 overflow-hidden">
@@ -507,7 +721,7 @@ export default function CommandMap({
 
       {/* Top Filter Bar */}
       <div className="absolute top-4 left-4 right-4 z-10 flex flex-col items-center gap-2 pointer-events-none">
-        <div className="glass-nav p-2 rounded-full pointer-events-auto flex gap-1 overflow-x-auto no-scrollbar shadow-lg max-w-full">
+        <div className="glass-nav p-2 rounded-full pointer-events-auto flex gap-1 overflow-x-auto no-scrollbar shadow-lg max-w-full items-center">
           <button
             onClick={() => setFilterCategory("All")}
             className={`px-4 py-2 rounded-full text-xs font-bold transition-colors cursor-pointer shrink-0 ${filterCategory === "All" ? "bg-primary text-white" : "text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-white/10"}`}
@@ -529,7 +743,58 @@ export default function CommandMap({
               {cat}
             </button>
           ))}
+          <div className="w-px h-5 bg-gray-300 dark:bg-gray-700 mx-1 shrink-0" />
+          <button
+            onClick={() => setShowLocationFilter((v) => !v)}
+            className={`px-4 py-2 rounded-full text-xs font-bold transition-colors cursor-pointer shrink-0 flex items-center gap-1.5 ${locationFilterActive || showLocationFilter ? "bg-primary text-white" : "text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-white/10"}`}
+          >
+            <MapPin className="w-3.5 h-3.5" />
+            {wardFilter !== "All" ? wardFilter : cityFilter !== "All" ? cityFilter : "Location"}
+          </button>
         </div>
+
+        {showLocationFilter && (
+          <div className="glass-nav pointer-events-auto rounded-2xl shadow-lg p-3 flex flex-wrap gap-2 items-center max-w-full">
+            <select
+              value={cityFilter}
+              onChange={(e) => {
+                setCityFilter(e.target.value);
+                setWardFilter("All");
+              }}
+              className="text-xs px-3 py-2 rounded-xl bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 text-gray-900 dark:text-white font-medium cursor-pointer outline-none"
+            >
+              <option value="All">All Cities</option>
+              {cityOptions.map((c) => (
+                <option key={c} value={c}>
+                  {c}
+                </option>
+              ))}
+            </select>
+            <select
+              value={wardFilter}
+              onChange={(e) => setWardFilter(e.target.value)}
+              className="text-xs px-3 py-2 rounded-xl bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 text-gray-900 dark:text-white font-medium cursor-pointer outline-none"
+            >
+              <option value="All">All Wards</option>
+              {wardOptions.map((w) => (
+                <option key={w} value={w}>
+                  {w}
+                </option>
+              ))}
+            </select>
+            {locationFilterActive && (
+              <button
+                onClick={() => {
+                  setCityFilter("All");
+                  setWardFilter("All");
+                }}
+                className="text-xs font-bold text-red-600 dark:text-red-400 px-3 py-2 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-xl"
+              >
+                Clear
+              </button>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Animated Bottom Sheet */}
@@ -554,7 +819,7 @@ export default function CommandMap({
             }}
             className="absolute bottom-0 left-0 right-0 z-20 flex justify-center pointer-events-none px-4"
           >
-            <div className="bg-white dark:bg-gray-900 w-full max-w-2xl rounded-t-[2rem] shadow-2xl dark:shadow-none pointer-events-auto flex flex-col max-h-[85vh] border border-gray-200 dark:border-gray-800 border-b-0 pb-8 sm:pb-6">
+            <div className="bg-white dark:bg-gray-900 w-full max-w-md sm:max-w-2xl rounded-t-[2rem] shadow-2xl dark:shadow-none pointer-events-auto flex flex-col max-h-[75vh] sm:max-h-[85vh] border border-gray-200 dark:border-gray-800 border-b-0 pb-6 sm:pb-6">
               {/* Grabber */}
               <div
                 className="w-full flex justify-center pt-4 pb-2 cursor-grab active:cursor-grabbing shrink-0"
@@ -612,7 +877,7 @@ export default function CommandMap({
                 </div>
 
                 <div
-                  className="relative rounded-2xl overflow-hidden bg-gray-100 dark:bg-gray-800 h-48 mb-6 group cursor-pointer"
+                  className="relative rounded-2xl overflow-hidden bg-gray-100 dark:bg-gray-800 h-40 sm:h-48 mb-5 sm:mb-6 group cursor-pointer"
                   onClick={() => setIsImageModalOpen(true)}
                 >
                   <img
@@ -635,6 +900,43 @@ export default function CommandMap({
                     {selectedIssue.status}
                   </div>
                 </div>
+
+                {/* Before / After comparison once an issue is resolved. */}
+                {selectedIssue.status === "Resolved" &&
+                  selectedIssue.resolvedImageUrl && (
+                    <div className="mb-6">
+                      <h4 className="text-[10px] text-gray-500 dark:text-gray-400 uppercase font-bold mb-2 tracking-widest">
+                        Before / After
+                      </h4>
+                      <div className="grid grid-cols-2 gap-2">
+                        <div className="relative rounded-xl overflow-hidden h-28 bg-gray-100 dark:bg-gray-800">
+                          <img
+                            src={selectedIssue.imageUrl}
+                            alt="Before"
+                            className="w-full h-full object-cover"
+                          />
+                          <span className="absolute bottom-1 left-1 bg-black/60 text-white text-[9px] font-bold uppercase px-1.5 py-0.5 rounded">
+                            Before
+                          </span>
+                        </div>
+                        <div className="relative rounded-xl overflow-hidden h-28 bg-gray-100 dark:bg-gray-800">
+                          <img
+                            src={selectedIssue.resolvedImageUrl}
+                            alt="After"
+                            className="w-full h-full object-cover"
+                          />
+                          <span className="absolute bottom-1 left-1 bg-emerald-600 text-white text-[9px] font-bold uppercase px-1.5 py-0.5 rounded">
+                            After
+                          </span>
+                        </div>
+                      </div>
+                      {typeof selectedIssue.resolutionConfidence === "number" && (
+                        <p className="text-[10px] text-emerald-600 dark:text-emerald-400 font-semibold mt-2">
+                          AI verified fix · {selectedIssue.resolutionConfidence}% confidence
+                        </p>
+                      )}
+                    </div>
+                  )}
 
                 <div className="bg-gray-50 dark:bg-gray-800/50 rounded-2xl p-4 text-sm text-gray-600 dark:text-gray-300 italic mb-6 leading-relaxed border border-gray-100 dark:border-gray-700">
                   "{selectedIssue.description || "No summary provided."}"
@@ -672,23 +974,33 @@ export default function CommandMap({
                 </div>
 
                 <div className="flex gap-3 mt-4">
-                  <motion.button
-                    whileTap={{ scale: 0.95 }}
-                    onClick={(e) => upvoteIssue(selectedIssue.id, e)}
-                    className={`flex-1 py-3.5 rounded-2xl font-bold text-xs uppercase tracking-widest flex justify-center items-center gap-2 transition-colors cursor-pointer shadow-sm ${currentUser && (selectedIssue.upvotedBy || []).includes(currentUser.uid) ? "bg-blue-600 text-white hover:bg-blue-700" : "bg-gray-100 dark:bg-gray-800 text-gray-900 dark:text-white hover:bg-gray-200 dark:hover:bg-gray-700"}`}
-                  >
-                    <ThumbsUp className="w-4 h-4" />
-                    {currentUser &&
-                    (selectedIssue.upvotedBy || []).includes(currentUser.uid)
-                      ? "Upvoted"
-                      : "Me Too"}
-                    <span className="bg-black/10 dark:bg-white/10 px-2 py-0.5 rounded-full ml-1">
-                      {selectedIssue.upvotesCount || 0}
-                    </span>
-                  </motion.button>
+                  {/* Upvote: citizens only, never on your own report. */}
+                  {!isStaff &&
+                  currentUser?.uid !== selectedIssue.reportedByUid ? (
+                    <motion.button
+                      whileTap={{ scale: 0.95 }}
+                      onClick={(e) => upvoteIssue(selectedIssue.id, e)}
+                      className={`flex-1 py-3.5 rounded-2xl font-bold text-xs uppercase tracking-widest flex justify-center items-center gap-2 transition-colors cursor-pointer shadow-sm ${currentUser && (selectedIssue.upvotedBy || []).includes(currentUser.uid) ? "bg-blue-600 text-white hover:bg-blue-700" : "bg-gray-100 dark:bg-gray-800 text-gray-900 dark:text-white hover:bg-gray-200 dark:hover:bg-gray-700"}`}
+                    >
+                      <ThumbsUp className="w-4 h-4" />
+                      {currentUser &&
+                      (selectedIssue.upvotedBy || []).includes(currentUser.uid)
+                        ? "Upvoted"
+                        : "Me Too"}
+                      <span className="bg-black/10 dark:bg-white/10 px-2 py-0.5 rounded-full ml-1">
+                        {selectedIssue.upvotesCount || 0}
+                      </span>
+                    </motion.button>
+                  ) : (
+                    <div className="flex-1 py-3.5 rounded-2xl font-bold text-xs uppercase tracking-widest flex justify-center items-center gap-2 bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400">
+                      <ThumbsUp className="w-4 h-4" />
+                      {selectedIssue.upvotesCount || 0} Upvotes
+                    </div>
+                  )}
 
                   {selectedIssue.status !== "Resolved" &&
-                    currentUser?.role === "staff" && (
+                    isStaff &&
+                    canActOnIssue(scope, selectedIssue) && (
                       <motion.button
                         whileTap={{ scale: 0.95 }}
                         onClick={(e) => startResolution(selectedIssue, e)}
@@ -704,6 +1016,37 @@ export default function CommandMap({
                       </motion.button>
                     )}
                 </div>
+
+                {/* RULE B — Official Staff Override: "Corroborate & Approve". */}
+                {isStaff &&
+                  canActOnIssue(scope, selectedIssue) &&
+                  selectedIssue.status !== "Staff Verified" &&
+                  selectedIssue.status !== "Resolved" && (
+                    <motion.button
+                      whileTap={{ scale: 0.95 }}
+                      onClick={(e) => handleApprove(selectedIssue, e)}
+                      disabled={approvingId === selectedIssue.id}
+                      className="mt-3 w-full bg-green-600 hover:bg-green-700 text-white py-3.5 rounded-2xl font-bold text-xs uppercase tracking-widest flex justify-center items-center gap-2 transition-colors cursor-pointer shadow-sm disabled:opacity-50"
+                    >
+                      <ShieldCheck className="w-4 h-4" />
+                      {approvingId === selectedIssue.id
+                        ? "Approving…"
+                        : "Corroborate & Approve"}
+                    </motion.button>
+                  )}
+
+                {upvoteError && (
+                  <div className="mt-3 p-3 bg-amber-50 dark:bg-amber-900/30 border border-amber-200 dark:border-amber-800 text-amber-700 dark:text-amber-400 text-xs rounded-xl">
+                    {upvoteError}
+                  </div>
+                )}
+
+                {petitionEligible(selectedIssue) && (
+                  <PetitionSection
+                    issue={selectedIssue}
+                    currentUser={currentUser}
+                  />
+                )}
 
                 <CommentsSection selectedIssue={selectedIssue} currentUser={currentUser} />
 

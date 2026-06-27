@@ -3,14 +3,28 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, Suspense, lazy } from "react";
+import React, { useState, useEffect, useRef, Suspense, lazy } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import {
   auth,
   db,
   syncCitizenProfile,
-  rewardImpactPoints,
+  computeImpactPoints,
+  computeReportsCount,
 } from "./lib/firebase";
+import {
+  loadRolesConfig,
+  resolveUserScope,
+  tierLabel,
+  issuesInScope,
+} from "./lib/roles";
+import {
+  neighborhoodAlerts,
+  missions as buildMissions,
+  petitionEligible,
+  homeWard,
+} from "./lib/civic";
+import { BADGES, BadgeMedal, computeBadgeStats } from "./lib/badges";
 import {
   onAuthStateChanged,
   signInWithEmailAndPassword,
@@ -19,6 +33,8 @@ import {
   signOut,
   GoogleAuthProvider,
   signInWithPopup,
+  signInWithRedirect,
+  getRedirectResult,
   updateProfile,
   User,
 } from "firebase/auth";
@@ -30,7 +46,7 @@ import {
   doc,
   updateDoc,
 } from "firebase/firestore";
-import { CitizenProfile, CivicIssue } from "./types";
+import { CitizenProfile, CivicIssue, UserScope } from "./types";
 
 const Reporter = lazy(() => import("./components/Reporter"));
 const CommandMap = lazy(() => import("./components/CommandMap"));
@@ -39,6 +55,7 @@ const StaffReportsList = lazy(() => import("./components/StaffReportsList"));
 const StaffDashboard = lazy(() => import("./components/StaffDashboard"));
 const SmartAssignmentBoard = lazy(() => import("./components/SmartAssignmentBoard"));
 const CivicAssistant = lazy(() => import("./components/CivicAssistant"));
+import CursorFx from "./components/CursorFx";
 
 import {
   LogOut,
@@ -75,12 +92,39 @@ export default function App() {
   const [loginRoleTab, setLoginRoleTab] = useState<"citizen" | "staff">(
     "citizen",
   );
+  // Authoritative permission scope, derived from the server-side staff
+  // allowlist (config/roles) — NOT from the client login toggle.
+  const [scope, setScope] = useState<UserScope>({ role: "citizen", wards: [] });
+  const isStaff = scope.role === "staff";
+  // Keep the latest chosen login intent readable inside stable callbacks.
+  const loginRoleTabRef = useRef(loginRoleTab);
+  useEffect(() => {
+    loginRoleTabRef.current = loginRoleTab;
+  }, [loginRoleTab]);
+
+  /**
+   * Resolves the user's authoritative scope from the allowlist. Bootstrap
+   * convenience: if NO staff are configured yet and the user explicitly chose
+   * the Staff tab, grant city-admin demo access so the app is usable out of the
+   * box. Once config/roles is seeded, real RBAC governs and this no longer fires.
+   */
+  const applyScope = async (uid: string): Promise<UserScope> => {
+    const roles = await loadRolesConfig();
+    let s = resolveUserScope(uid, roles);
+    const noRegistry = Object.keys(roles.staff || {}).length === 0;
+    if (s.role === "citizen" && loginRoleTabRef.current === "staff" && noRegistry) {
+      s = { role: "staff", tier: "city", wards: [] };
+    }
+    setScope(s);
+    return s;
+  };
+
   const [selectedIssueFromParent, setSelectedIssueFromParent] =
     useState<CivicIssue | null>(null);
 
   const [isDropdownOpen, setIsDropdownOpen] = useState<boolean>(false);
   const [activeModal, setActiveModal] = useState<
-    "profile" | "my-reports" | null
+    "profile" | "my-reports" | "notifications" | null
   >(null);
   const [leaderboardCity, setLeaderboardCity] = useState<"Bangalore" | "Other">(
     "Bangalore",
@@ -88,8 +132,8 @@ export default function App() {
   const [customSeed, setCustomSeed] = useState<string>("");
 
   const [isDarkMode, setIsDarkMode] = useState<boolean>(false);
-  const [showNotifications, setShowNotifications] = useState<boolean>(false);
-  const [isNotificationsExpanded, setIsNotificationsExpanded] = useState<boolean>(false);
+  // Cursor position (in %) for the login screen's mouse-following spotlight.
+  const [loginMouse, setLoginMouse] = useState({ x: 50, y: 42 });
 
   const [isAuthMode, setIsAuthMode] = useState<"login" | "register">("login");
   const [email, setEmail] = useState<string>("");
@@ -97,20 +141,132 @@ export default function App() {
   const [name, setName] = useState<string>("");
   const [authError, setAuthError] = useState<string | null>(null);
   const [authLoading, setAuthLoading] = useState<boolean>(false);
+  // Email-OTP registration flow.
+  const [otpStep, setOtpStep] = useState<"form" | "code">("form");
+  const [otpCode, setOtpCode] = useState<string>("");
+  const [otpDevHint, setOtpDevHint] = useState<string | null>(null);
+  const [resendCooldown, setResendCooldown] = useState<number>(0);
 
-  const userNotifications = issues
-    .filter((i) => i.reportedByUid === user?.uid && i.status !== "Reported")
-    .map((i) => ({
-      id: i.id,
-      message: `Your ${i.category} report is now ${i.status}.`,
-      time: i.reportedAt,
-    }))
-    .sort((a, b) => new Date(b.time).getTime() - new Date(a.time).getTime())
-    .slice(0, 5);
-    
-  const currentUserIssues = issues.filter(i => i.reportedByUid === user?.uid);
-  const liveReportsCount = currentUserIssues.length;
-  const liveImpactPoints = 20 + currentUserIssues.reduce((sum, i) => sum + 10 + (i.status === "Resolved" ? 50 : 0), 0);
+  useEffect(() => {
+    if (resendCooldown <= 0) return;
+    const t = setTimeout(() => setResendCooldown((s) => s - 1), 1000);
+    return () => clearTimeout(t);
+  }, [resendCooldown]);
+
+  const liveReportsCount = user ? computeReportsCount(issues, user.uid) : 0;
+  const liveImpactPoints = user ? computeImpactPoints(issues, user.uid) : 0;
+  const myHomeWard = homeWard(issues, user?.uid, profile?.ward);
+  const badgeStats = computeBadgeStats(issues, user?.uid, liveImpactPoints);
+
+  // Unified civic-alert feed (latest first): status updates + Neighbourhood
+  // Watch + Petition calls-to-action + a Mission nudge. The dropdown shows the
+  // newest; the Notifications page lists them all.
+  type AlertKind = "status" | "watch" | "petition" | "mission";
+  interface CivicAlert {
+    id: string;
+    kind: AlertKind;
+    message: string;
+    time: number;
+    issueId?: string;
+    imageUrl?: string;
+  }
+  const userNotifications: CivicAlert[] = (() => {
+    if (!user) return [];
+    const out: CivicAlert[] = [];
+    const now = Date.now();
+
+    if (isStaff) {
+      // Staff get queue alerts within their scope — NOT "your report" updates.
+      const scoped = issuesInScope(scope, issues);
+      for (const i of scoped) {
+        if (i.status === "Resolved") continue;
+        const ageH = (now - i.reportedAt) / 3_600_000;
+        const overdue =
+          (i.priorityTier === "P1" || i.priorityTier === "P2") &&
+          i.slaTargetHours &&
+          ageH > i.slaTargetHours;
+        if (overdue) {
+          out.push({
+            id: `sla-${i.id}`,
+            kind: "watch",
+            message: `SLA breach: ${i.priorityTier} ${i.category}${i.ward ? ` in ${i.ward}` : ""} is overdue and needs action.`,
+            time: i.reportedAt,
+            issueId: i.id,
+          });
+        } else if (now - i.reportedAt < 48 * 3_600_000) {
+          out.push({
+            id: `new-${i.id}`,
+            kind: "status",
+            message: `New ${i.category} reported${i.ward ? ` in ${i.ward}` : ""} (${i.priorityTier || "P3"}).`,
+            time: i.reportedAt,
+            issueId: i.id,
+            imageUrl: i.imageUrl,
+          });
+        }
+      }
+    } else {
+      // 1. Status updates on your own reports (citizens only).
+      for (const i of issues) {
+        if (i.reportedByUid === user.uid && i.status !== "Reported") {
+          out.push({
+            id: `status-${i.id}`,
+            kind: "status",
+            message: `Your ${i.category} report is now ${i.status}.`,
+            time: i.reportedAt,
+            issueId: i.id,
+            imageUrl: i.imageUrl,
+          });
+        }
+      }
+
+      // 2. Neighbourhood Watch.
+      for (const a of neighborhoodAlerts(issues, user.uid, profile?.ward)) {
+        out.push({
+          id: a.id,
+          kind: "watch",
+          message: a.message,
+          time: a.time,
+          issueId: a.issueId,
+        });
+      }
+      // 3. Petition calls-to-action (issues you're connected to).
+      for (const i of issues) {
+        const connected =
+          i.ward === myHomeWard ||
+          i.reportedByUid === user.uid ||
+          (i.upvotedBy || []).includes(user.uid);
+        if (i.petition && petitionEligible(i) && connected) {
+          out.push({
+            id: `pet-${i.id}`,
+            kind: "petition",
+            message: `"${i.category}" near ${i.ward || "you"} reached ${i.upvotesCount || 0} upvotes — a petition has been drafted. Add your signature?`,
+            time: i.petition.draftedAt,
+            issueId: i.id,
+          });
+        }
+      }
+      // 4. One personalised Mission nudge.
+      const top = buildMissions(
+        issues,
+        user.uid,
+        liveImpactPoints,
+        profile?.ward,
+      )[0];
+      if (top) {
+        out.push({
+          id: `mission-${top.id}`,
+          kind: "mission",
+          message: `Mission · ${top.title} — ${top.detail}`,
+          time: Date.now(),
+          issueId: top.issueId,
+        });
+      }
+    }
+
+    return out.sort((a, b) => b.time - a.time);
+  })();
+  // Staff only manage issues within their hierarchy scope (field=ward, zonal=zone, city=all).
+  const scopedIssues = isStaff ? issuesInScope(scope, issues) : issues;
 
   useEffect(() => {
     // If a sandbox session was stored previously, initialize it right away
@@ -122,12 +278,13 @@ export default function App() {
           email: "developer@civic.local",
           photoURL:
             "https://api.dicebear.com/7.x/bottts/svg?seed=sandbox-dev-citizen",
-        } as any;
+        } as unknown as User;
         setUser(mockUser);
         try {
           const userProfile = await syncCitizenProfile(mockUser, "citizen");
-          setProfile(userProfile);
-          if (userProfile.role === "staff") setActiveTab("map");
+          const s = await applyScope(mockUser.uid);
+          setProfile({ ...userProfile, role: s.role });
+          if (s.role === "staff") setActiveTab("map");
         } catch (err) {
           setProfile({
             uid: "sandbox-dev-citizen",
@@ -145,19 +302,21 @@ export default function App() {
     };
     initSandbox();
 
+    // Complete a Google redirect sign-in (used when the popup is blocked).
+    getRedirectResult(auth).catch((e) => {
+      console.warn("Google redirect sign-in did not complete:", e?.message || e);
+    });
+
     const unsubscribeAuth = onAuthStateChanged(auth, async (firebaseUser) => {
       setAuthLoading(true);
       if (firebaseUser) {
         localStorage.removeItem("civic_sandbox_session");
         setUser(firebaseUser);
         try {
-          const userProfile = await syncCitizenProfile(
-            firebaseUser,
-            loginRoleTab,
-          );
-          setProfile(userProfile);
-          if (userProfile.role === "staff" || loginRoleTab === "staff")
-            setActiveTab("map");
+          const userProfile = await syncCitizenProfile(firebaseUser);
+          const s = await applyScope(firebaseUser.uid);
+          setProfile({ ...userProfile, role: s.role });
+          if (s.role === "staff") setActiveTab("map");
         } catch (err) {}
       } else {
         setUser((prev) => {
@@ -222,32 +381,87 @@ export default function App() {
     setAuthError(null);
     setAuthLoading(true);
     try {
-      const cred = await signInWithEmailAndPassword(auth, email, password);
-      const p = await syncCitizenProfile(cred.user, loginRoleTab);
-      setProfile(p);
-      if (p.role === "staff" || loginRoleTab === "staff") setActiveTab("map");
-    } catch (err: any) {
-      setAuthError(err.message);
+      // onAuthStateChanged resolves profile + authoritative scope + landing tab.
+      await signInWithEmailAndPassword(auth, email, password);
+    } catch (err) {
+      setAuthError(err instanceof Error ? err.message : "Sign in failed.");
     } finally {
       setAuthLoading(false);
     }
   };
 
+  // Registration is now two-step: email OTP, then account creation.
   const handleEmailRegister = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthError(null);
+    if (loginRoleTab === "staff") {
+      // Staff accounts are provisioned via the allowlist, not self-registration.
+      setIsAuthMode("login");
+      return;
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      setAuthError("Please enter a valid email address.");
+      return;
+    }
+    if (password.length < 6) {
+      setAuthError("Password must be at least 6 characters.");
+      return;
+    }
     setAuthLoading(true);
     try {
+      const res = await fetch("/api/send-otp", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Couldn't send the code.");
+      setOtpDevHint(data.devCode ? `Testing code: ${data.devCode}` : null);
+      setOtpStep("code");
+      setResendCooldown(30); // throttle resends
+      setOtpCode("");
+    } catch (err) {
+      setAuthError(err instanceof Error ? err.message : "Couldn't send the code.");
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const handleVerifyOtp = async () => {
+    setAuthError(null);
+    setAuthLoading(true);
+    try {
+      const res = await fetch("/api/verify-otp", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, code: otpCode }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.verified)
+        throw new Error(data.error || "Verification failed.");
+      // Email confirmed — now create the account.
       const cred = await createUserWithEmailAndPassword(auth, email, password);
       await updateProfile(cred.user, {
         displayName: name || email.split("@")[0],
         photoURL: `https://api.dicebear.com/7.x/bottts/svg?seed=${cred.user.uid}`,
       });
-      const p = await syncCitizenProfile(cred.user, loginRoleTab);
-      setProfile(p);
-      if (p.role === "staff" || loginRoleTab === "staff") setActiveTab("map");
-    } catch (err: any) {
-      setAuthError(err.message);
+      setOtpStep("form");
+      setOtpCode("");
+      // onAuthStateChanged finalises profile + scope.
+    } catch (err) {
+      const code =
+        err && typeof err === "object" && "code" in err
+          ? String((err as { code: string }).code)
+          : "";
+      if (code === "auth/operation-not-allowed") {
+        setAuthError(
+          "Email sign-up isn't enabled for this app yet. Admin: enable Email/Password in Firebase → Authentication → Sign-in method.",
+        );
+      } else if (code === "auth/email-already-in-use") {
+        setAuthError("That email is already registered — try signing in instead.");
+      } else {
+        setAuthError(err instanceof Error ? err.message : "Verification failed.");
+      }
     } finally {
       setAuthLoading(false);
     }
@@ -256,13 +470,32 @@ export default function App() {
   const handleGoogleSignIn = async () => {
     setAuthError(null);
     setAuthLoading(true);
+    const provider = new GoogleAuthProvider();
     try {
-      const cred = await signInWithPopup(auth, new GoogleAuthProvider());
-      const p = await syncCitizenProfile(cred.user, loginRoleTab);
-      setProfile(p);
-      if (p.role === "staff" || loginRoleTab === "staff") setActiveTab("map");
-    } catch (err: any) {
-      setAuthError("Sign in popup blocked or failed.");
+      await signInWithPopup(auth, provider);
+      // onAuthStateChanged finalises profile + scope.
+    } catch (err) {
+      const code =
+        err && typeof err === "object" && "code" in err
+          ? String((err as { code: string }).code)
+          : "";
+      if (
+        code === "auth/popup-closed-by-user" ||
+        code === "auth/cancelled-popup-request"
+      ) {
+        setAuthError("Sign-in was cancelled.");
+      } else {
+        // Popups are frequently blocked (ad-blockers, embedded previews, COOP).
+        // Fall back to a full-page redirect, which is far more reliable.
+        try {
+          await signInWithRedirect(auth, provider);
+          return; // page navigates away to Google
+        } catch {
+          setAuthError(
+            "Couldn't open Google sign-in. Please allow popups/redirects for this site, or sign in with email.",
+          );
+        }
+      }
     } finally {
       setAuthLoading(false);
     }
@@ -290,10 +523,8 @@ export default function App() {
         displayName: `Hero_${Math.floor(1000 + Math.random() * 9000)}`,
         photoURL: `https://api.dicebear.com/7.x/bottts/svg?seed=${cred.user.uid}`,
       });
-      const p = await syncCitizenProfile(cred.user, loginRoleTab);
-      setProfile(p);
-      if (p.role === "staff" || loginRoleTab === "staff") setActiveTab("map");
-    } catch (err: any) {
+      // onAuthStateChanged finalises profile + scope.
+    } catch (err) {
       console.warn(
         "Anonymous sign-in failed. Activating local sandbox resilient developer access...",
         err,
@@ -307,14 +538,15 @@ export default function App() {
           email: "developer@civic.local",
           photoURL:
             "https://api.dicebear.com/7.x/bottts/svg?seed=sandbox-dev-citizen",
-        } as any;
+        } as unknown as User;
         setUser(mockUser);
-        const userProfile = await syncCitizenProfile(mockUser, loginRoleTab);
-        setProfile(userProfile);
-        if (userProfile.role === "staff" || loginRoleTab === "staff")
-          setActiveTab("map");
-      } catch (fallbackErr: any) {
-        // Even if Firestore fails, give them a simulated full mock profile
+        const userProfile = await syncCitizenProfile(mockUser, "citizen");
+        const s = await applyScope(mockUser.uid);
+        setProfile({ ...userProfile, role: s.role });
+        if (s.role === "staff") setActiveTab("map");
+      } catch (fallbackErr) {
+        // Even if Firestore fails, give them a simulated mock profile.
+        const s = await applyScope("sandbox-dev-citizen");
         setProfile({
           uid: "sandbox-dev-citizen",
           displayName: "Sandbox Developer",
@@ -324,9 +556,9 @@ export default function App() {
           impactPoints: 20,
           civicRank: "Civic Novice",
           reportsCount: 0,
-          role: loginRoleTab,
+          role: s.role,
         });
-        if (loginRoleTab === "staff") setActiveTab("map");
+        if (s.role === "staff") setActiveTab("map");
       }
     } finally {
       setAuthLoading(false);
@@ -460,16 +692,24 @@ export default function App() {
     switch (status) {
       case "Resolved":
         return "bg-emerald-50 text-emerald-700 border-emerald-200";
+      // Trust Engine: staff override is the highest tier → green/high-priority.
+      case "Staff Verified":
+        return "bg-green-50 text-green-700 border-green-300 dark:bg-green-900/30 dark:text-green-400";
       case "In Progress":
         return "bg-amber-50 text-amber-700 border-amber-200";
       case "Corroborated Report":
       case "Corroborated":
+      case "Community Verified":
         return "bg-blue-50 text-blue-700 border-blue-200";
       case "Auto-Routed":
         return "bg-purple-50 text-purple-700 border-purple-200";
+      // Suspected-fraud reports are parked for review → danger red.
+      case "Flagged for Review":
+        return "bg-red-50 text-red-700 border-red-300 dark:bg-red-900/30 dark:text-red-400";
       case "Requires Human Verification":
       case "Verify Report":
         return "bg-rose-50 text-rose-700 border-rose-200";
+      case "Pending Verification":
       case "Reported":
       default:
         return "bg-gray-100 text-gray-700 border-gray-300";
@@ -505,8 +745,9 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen bg-gray-50 dark:bg-gray-950 flex flex-col justify-between font-sans text-[#1A1A1A] dark:text-white transition-colors duration-300">
-      <header className="h-16 bg-white/80 dark:bg-gray-900/80 backdrop-blur-md border-b border-[#E5E5E5] dark:border-gray-800 flex items-center justify-between px-6 z-10 w-full sticky top-0">
+    <div className="min-h-screen w-full overflow-x-hidden bg-gray-50 dark:bg-gray-950 flex flex-col justify-between font-sans text-[#1A1A1A] dark:text-white transition-colors duration-300">
+      <CursorFx />
+      <header className="h-16 bg-white/80 dark:bg-gray-900/80 backdrop-blur-md border-b border-[#E5E5E5] dark:border-gray-800 flex items-center justify-between px-4 sm:px-6 z-50 w-full sticky top-0">
         <div className="flex items-center gap-3">
           <img src="/civic-wordmark.svg" alt="CIVIC" className="h-6 sm:h-7 dark:invert" />
         </div>
@@ -514,7 +755,7 @@ export default function App() {
         <div className="flex items-center gap-4 relative">
           {user ? (
             <div className="relative flex items-center gap-2">
-              {profile?.role !== "staff" && (
+              {!isStaff && (
                 <div className="text-right hidden sm:block">
                   <div className="text-xs font-bold text-[#4A4A4A] dark:text-gray-400 uppercase tracking-wider">
                     Civic Rank
@@ -524,13 +765,13 @@ export default function App() {
                   </div>
                 </div>
               )}
-              {profile?.role === "staff" && (
+              {isStaff && (
                 <div className="text-right hidden sm:block">
                   <div className="text-xs font-bold text-blue-600 dark:text-blue-400 uppercase tracking-wider">
                     Staff Role
                   </div>
                   <div className="text-sm text-blue-700 dark:text-blue-300 font-semibold">
-                    Municipal Administrator
+                    {tierLabel(scope.tier)}
                   </div>
                 </div>
               )}
@@ -579,44 +820,37 @@ export default function App() {
                   </div>
                   
                   {userNotifications.length > 0 && (
-                    <div 
-                      className={`px-4 py-2 border-b border-[#F0F0F0] dark:border-gray-800 bg-red-50/50 dark:bg-red-900/10 ${userNotifications.length > 1 ? 'cursor-pointer hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors' : ''}`}
-                      onClick={() => {
-                        if (userNotifications.length > 1) {
-                          setIsNotificationsExpanded(!isNotificationsExpanded);
-                        }
-                      }}
-                      role={userNotifications.length > 1 ? "button" : "region"}
-                      tabIndex={userNotifications.length > 1 ? 0 : undefined}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter' || e.key === ' ') {
-                          e.preventDefault();
-                          if (userNotifications.length > 1) setIsNotificationsExpanded(!isNotificationsExpanded);
-                        }
-                      }}
-                    >
+                    <div className="px-4 py-2 border-b border-[#F0F0F0] dark:border-gray-800 bg-red-50/50 dark:bg-red-900/10">
                       <div className="flex items-center justify-between mb-2">
                         <p className="text-[10px] text-red-600 dark:text-red-400 font-bold uppercase tracking-wider flex items-center gap-1.5">
                           <Bell className="w-3 h-3" /> Notifications
                         </p>
-                        {userNotifications.length > 1 && (
-                          <span className="text-[10px] text-red-600/70 dark:text-red-400/70 font-semibold">
-                            {isNotificationsExpanded ? "Show Less" : `+${userNotifications.length - 1} more`}
-                          </span>
-                        )}
+                        <span className="text-[10px] text-red-600/70 dark:text-red-400/70 font-semibold">
+                          {userNotifications.length}
+                        </span>
                       </div>
-                      <div className="space-y-2">
-                        {(isNotificationsExpanded ? userNotifications : [userNotifications[0]]).map((n) => (
-                          <div key={n.id} className="text-xs text-gray-800 dark:text-gray-200">
-                            <span className="font-semibold block">{n.message}</span>
-                            <span className="text-[9px] text-gray-500">{new Date(n.time).toLocaleTimeString()}</span>
-                          </div>
-                        ))}
+                      {/* Latest only in the dropdown */}
+                      <div className="text-xs text-gray-800 dark:text-gray-200">
+                        <span className="font-semibold block">
+                          {userNotifications[0].message}
+                        </span>
+                        <span className="text-[9px] text-gray-500">
+                          {new Date(userNotifications[0].time).toLocaleString()}
+                        </span>
                       </div>
+                      <button
+                        onClick={() => {
+                          setIsDropdownOpen(false);
+                          setActiveModal("notifications");
+                        }}
+                        className="mt-2 w-full text-center text-[10px] font-bold uppercase tracking-wider text-red-600 dark:text-red-400 hover:bg-red-100/60 dark:hover:bg-red-900/20 rounded-lg py-1.5 transition-colors cursor-pointer"
+                      >
+                        View all notifications
+                      </button>
                     </div>
                   )}
 
-                  {profile?.role !== "staff" ? (
+                  {!isStaff ? (
                     <>
                       <button
                         onClick={() => {
@@ -640,8 +874,13 @@ export default function App() {
                       </button>
                     </>
                   ) : (
-                    <div className="px-4 py-2 text-[9px] font-bold text-blue-600 bg-blue-50/50 uppercase tracking-widest my-1 text-center rounded-lg mx-2">
-                      Municipal Administrator
+                    <div className="px-4 py-2 text-[9px] font-bold text-blue-600 bg-blue-50/50 dark:bg-blue-900/20 uppercase tracking-widest my-1 text-center rounded-lg mx-2">
+                      {tierLabel(scope.tier)}
+                      {scope.tier === "field" && scope.wards.length > 0 && (
+                        <span className="block text-[8px] mt-0.5 normal-case tracking-normal text-blue-500">
+                          {scope.wards.join(", ")}
+                        </span>
+                      )}
                     </div>
                   )}
 
@@ -669,30 +908,32 @@ export default function App() {
       </header>
 
       <main
-        className={`${activeTab === "map" && user ? "flex-1 w-full relative" : (!user ? "flex-1 w-full flex flex-col sm:max-w-7xl sm:mx-auto sm:px-4 sm:py-8" : "max-w-7xl mx-auto px-4 py-8 flex-1 w-full flex flex-col gap-6")}`}
+        className={`${activeTab === "map" && user ? "flex-1 w-full relative" : (!user ? "flex-1 w-full flex flex-col sm:max-w-7xl sm:mx-auto sm:px-4 sm:py-8" : "max-w-7xl mx-auto px-4 py-8 flex-1 w-full min-w-0 flex flex-col gap-6")}`}
       >
         {!user ? (
-          <div className="flex-1 w-full flex items-center justify-center relative overflow-hidden bg-gray-50 dark:bg-gray-900 sm:rounded-3xl mx-auto my-auto max-w-7xl h-full sm:h-[90vh] sm:max-h-[900px]">
-            {/* Animated background gradient */}
-            <motion.div
-              className="absolute inset-0 z-0 opacity-40 dark:opacity-60"
-              animate={{
-                background: [
-                  "radial-gradient(circle at 0% 0%, var(--color-brand-teal) 0%, transparent 50%)",
-                  "radial-gradient(circle at 100% 100%, var(--color-brand-blue) 0%, transparent 50%)",
-                  "radial-gradient(circle at 0% 100%, var(--color-brand-teal-light) 0%, transparent 50%)",
-                  "radial-gradient(circle at 100% 0%, var(--color-brand-ink) 0%, transparent 50%)",
-                  "radial-gradient(circle at 0% 0%, var(--color-brand-teal) 0%, transparent 50%)",
-                ]
+          <div
+            className="flex-1 w-full flex items-center justify-center relative overflow-hidden bg-gray-50 dark:bg-gray-900 sm:rounded-3xl mx-auto my-auto max-w-7xl h-full sm:h-[90vh] sm:max-h-[900px]"
+            onMouseMove={(e) => {
+              const r = e.currentTarget.getBoundingClientRect();
+              setLoginMouse({
+                x: ((e.clientX - r.left) / r.width) * 100,
+                y: ((e.clientY - r.top) / r.height) * 100,
+              });
+            }}
+          >
+            {/* Spotlight that smoothly follows the cursor */}
+            <div
+              className="absolute inset-0 z-0 opacity-60 dark:opacity-70 transition-all duration-300 ease-out"
+              style={{
+                background: `radial-gradient(600px circle at ${loginMouse.x}% ${loginMouse.y}%, var(--color-brand-teal-light), transparent 42%), radial-gradient(720px circle at ${100 - loginMouse.x}% ${100 - loginMouse.y}%, var(--color-brand-blue), transparent 48%)`,
               }}
-              transition={{ duration: 20, ease: "linear", repeat: Infinity }}
             />
-            
+
             <motion.div 
               initial={{ opacity: 0, y: 20, scale: 0.95 }}
               animate={{ opacity: 1, y: 0, scale: 1 }}
               transition={{ type: "spring", stiffness: 300, damping: 30 }}
-              className="max-w-md w-full mx-auto glass-card rounded-t-[2rem] sm:rounded-[2rem] overflow-y-auto p-6 sm:p-10 space-y-6 sm:space-y-8 z-10 mt-12 sm:m-4 shadow-2xl backdrop-blur-xl bg-white/70 dark:bg-gray-900/70 border border-white/20 dark:border-gray-800/50 absolute bottom-0 sm:relative sm:bottom-auto h-auto max-h-[85vh] sm:max-h-[calc(100%-2rem)] flex flex-col"
+              className="max-w-md w-[calc(100%-2rem)] mx-auto glass-card rounded-[2rem] overflow-y-auto p-6 sm:p-10 space-y-6 sm:space-y-8 z-10 my-6 sm:m-4 shadow-2xl backdrop-blur-xl bg-white/70 dark:bg-gray-900/70 border border-white/20 dark:border-gray-800/50 relative h-auto max-h-[85vh] sm:max-h-[calc(100%-2rem)] flex flex-col"
             >
               <div className="text-center space-y-3">
                 <h1 className="font-display font-bold text-4xl sm:text-5xl tracking-tight text-gray-900 dark:text-white">
@@ -705,13 +946,25 @@ export default function App() {
 
               <div className="flex bg-gray-100/50 dark:bg-gray-800/50 p-1.5 rounded-2xl mb-8 backdrop-blur-sm">
                 <button
-                  onClick={() => setLoginRoleTab("citizen")}
+                  type="button"
+                  onClick={() => {
+                    setLoginRoleTab("citizen");
+                    setAuthError(null);
+                  }}
                   className={`flex-1 py-2.5 rounded-xl text-xs font-bold transition-all duration-300 ${loginRoleTab === "citizen" ? "bg-white dark:bg-gray-700 shadow-md text-gray-900 dark:text-white" : "text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white hover:bg-gray-200/50 dark:hover:bg-gray-700/50"}`}
                 >
                   Citizen
                 </button>
                 <button
-                  onClick={() => setLoginRoleTab("staff")}
+                  type="button"
+                  onClick={() => {
+                    // Staff don't self-register — force the sign-in view.
+                    setLoginRoleTab("staff");
+                    setIsAuthMode("login");
+                    setOtpStep("form");
+                    setOtpCode("");
+                    setAuthError(null);
+                  }}
                   className={`flex-1 py-2.5 rounded-xl text-xs font-bold transition-all duration-300 ${loginRoleTab === "staff" ? "bg-white dark:bg-gray-700 shadow-md text-gray-900 dark:text-white" : "text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white hover:bg-gray-200/50 dark:hover:bg-gray-700/50"}`}
                 >
                   Staff
@@ -747,6 +1000,70 @@ export default function App() {
                   <div className="flex-grow border-t border-gray-200 dark:border-gray-700"></div>
                 </div>
 
+                {isAuthMode === "register" && otpStep === "code" ? (
+                  <div className="space-y-4 animate-in fade-in slide-in-from-right-3 duration-200">
+                    <div className="text-center">
+                      <p className="text-sm text-gray-700 dark:text-gray-300">
+                        Enter the 6-digit code we sent to
+                      </p>
+                      <p className="text-sm font-bold text-gray-900 dark:text-white break-all">
+                        {email}
+                      </p>
+                      {otpDevHint && (
+                        <p className="text-[11px] text-amber-600 dark:text-amber-400 mt-1 font-semibold">
+                          {otpDevHint}
+                        </p>
+                      )}
+                    </div>
+                    <input
+                      inputMode="numeric"
+                      autoFocus
+                      maxLength={6}
+                      value={otpCode}
+                      onChange={(e) =>
+                        setOtpCode(e.target.value.replace(/\D/g, "").slice(0, 6))
+                      }
+                      placeholder="••••••"
+                      className="block w-full text-center tracking-[0.5em] text-lg font-bold px-4 py-3.5 bg-white/50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-700 rounded-2xl focus:outline-none focus:ring-2 focus:ring-primary text-gray-900 dark:text-white"
+                    />
+                    <p className="text-[11px] text-gray-500 dark:text-gray-400 text-center">
+                      Didn't get it? Check your <strong>spam / junk</strong> folder
+                      (it can take a minute to arrive).
+                    </p>
+                    <button
+                      onClick={handleVerifyOtp}
+                      disabled={authLoading || otpCode.length !== 6}
+                      className="w-full bg-primary hover:bg-primary-dark text-white font-bold py-3.5 rounded-2xl text-sm transition-all duration-300 cursor-pointer shadow-md disabled:opacity-60 flex items-center justify-center"
+                    >
+                      {authLoading ? (
+                        <img src="/civic-logo.svg" className="w-5 h-5 animate-pulse invert" alt="Loading" />
+                      ) : (
+                        "Verify & Create Account"
+                      )}
+                    </button>
+                    <div className="flex justify-between text-xs">
+                      <button
+                        onClick={() => {
+                          setOtpStep("form");
+                          setOtpCode("");
+                          setAuthError(null);
+                        }}
+                        className="text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white font-semibold"
+                      >
+                        ← Back
+                      </button>
+                      <button
+                        onClick={(e) => handleEmailRegister(e as unknown as React.FormEvent)}
+                        disabled={authLoading || resendCooldown > 0}
+                        className="text-primary font-semibold hover:underline disabled:opacity-50 disabled:no-underline disabled:cursor-not-allowed"
+                      >
+                        {resendCooldown > 0
+                          ? `Resend in ${resendCooldown}s`
+                          : "Resend code"}
+                      </button>
+                    </div>
+                  </div>
+                ) : (
                 <form
                   onSubmit={isAuthMode === "login" ? handleEmailLogin : handleEmailRegister}
                   className="space-y-4"
@@ -798,21 +1115,31 @@ export default function App() {
                     {authLoading ? (
                       <img src="/civic-logo.svg" className="w-5 h-5 animate-pulse invert" alt="Loading" />
                     ) : (
-                      isAuthMode === "login" ? "Sign In" : "Create Account"
+                      isAuthMode === "login" ? "Sign In" : "Send Verification Code"
                     )}
                   </button>
                 </form>
+                )}
 
-                <div className="text-center mt-6">
-                  <button
-                    onClick={() => setIsAuthMode(isAuthMode === "login" ? "register" : "login")}
-                    className="text-xs text-primary hover:text-primary-dark dark:hover:text-primary-light font-semibold transition-colors"
-                  >
-                    {isAuthMode === "login"
-                      ? "Need an account? Sign up"
-                      : "Already have an account? Sign in"}
-                  </button>
-                </div>
+                {/* Staff are allowlisted, not self-registered — no sign-up here. */}
+                {loginRoleTab !== "staff" && (
+                  <div className="text-center mt-6">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsAuthMode(isAuthMode === "login" ? "register" : "login");
+                        setOtpStep("form");
+                        setOtpCode("");
+                        setAuthError(null);
+                      }}
+                      className="text-xs text-primary hover:text-primary-dark dark:hover:text-primary-light font-semibold transition-colors"
+                    >
+                      {isAuthMode === "login"
+                        ? "Need an account? Sign up"
+                        : "Already have an account? Sign in"}
+                    </button>
+                  </div>
+                )}
                 
                 <div className="pt-4 border-t border-gray-200 dark:border-gray-700 text-center">
                    <button
@@ -869,6 +1196,7 @@ export default function App() {
                       <CommandMap
                         issues={issues}
                         currentUser={user}
+                        scope={scope}
                         selectedIssueFromParent={selectedIssueFromParent}
                         isDarkMode={isDarkMode}
                       />
@@ -878,17 +1206,22 @@ export default function App() {
                     )}
                     {activeTab === "staff-list" && (
                       <StaffReportsList
-                        issues={issues}
+                        issues={scopedIssues}
+                        scope={scope}
                         currentUser={user}
                         onSelectIssue={(issue) => setSelectedIssueFromParent(issue)}
                         onSetTab={(tab) => setActiveTab(tab)}
                       />
                     )}
                     {activeTab === "staff-analytics" && (
-                      <StaffDashboard issues={issues} />
+                      <StaffDashboard issues={scopedIssues} scope={scope} />
                     )}
                     {activeTab === "staff-kanban" && (
-                      <SmartAssignmentBoard issues={issues} />
+                      <SmartAssignmentBoard
+                        issues={scopedIssues}
+                        currentUser={user}
+                        scope={scope}
+                      />
                     )}
                   </motion.div>
                 </AnimatePresence>
@@ -898,9 +1231,9 @@ export default function App() {
         )}
       </main>
 
-      {user && profile && profile.role === "citizen" && (
+      {user && profile && !isStaff && (
         <Suspense fallback={null}>
-          <CivicAssistant currentUser={user} />
+          <CivicAssistant currentUser={user} issues={issues} />
         </Suspense>
       )}
 
@@ -910,8 +1243,8 @@ export default function App() {
           className="fixed bottom-6 left-0 right-0 z-40 pointer-events-none flex justify-center px-4"
           style={{ paddingBottom: 'env(safe-area-inset-bottom)' }}
         >
-          <div className="glass-nav rounded-full p-1.5 flex gap-1 items-center pointer-events-auto shadow-xl">
-            {profile.role !== "staff" && (
+          <div className="glass-nav rounded-full p-1.5 flex gap-1 items-center pointer-events-auto shadow-xl max-w-[calc(100vw-2rem)] overflow-x-auto no-scrollbar">
+            {!isStaff && (
               <button
                 onClick={() => setActiveTab("reporter")}
                 className="relative px-4 sm:px-5 py-2.5 rounded-full text-xs font-bold transition-colors cursor-pointer group flex items-center gap-2"
@@ -958,7 +1291,7 @@ export default function App() {
               </span>
             </button>
 
-            {profile.role === "staff" && (
+            {isStaff && (
               <>
                 <button
                   onClick={() => setActiveTab("staff-analytics")}
@@ -1035,7 +1368,7 @@ export default function App() {
               </>
             )}
 
-            {profile.role !== "staff" && (
+            {!isStaff && (
               <button
                 onClick={() => setActiveTab("impact")}
                 className="relative px-4 sm:px-5 py-2.5 rounded-full text-xs font-bold transition-colors cursor-pointer group flex items-center gap-2"
@@ -1078,7 +1411,7 @@ export default function App() {
       {/* Profile & Leaderboard Modal */}
       {activeModal === "profile" && profile && (
         <div className="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center p-4 z-50 animate-in fade-in duration-200">
-          <div className="bg-white dark:bg-gray-900 rounded-3xl border border-[#E5E5E5] dark:border-gray-800 max-w-2xl w-full p-6 md:p-8 space-y-6 shadow-2xl relative max-h-[90vh] overflow-y-auto animate-in zoom-in-95 duration-200">
+          <div className="bg-white dark:bg-gray-900 rounded-3xl border border-[#E5E5E5] dark:border-gray-800 max-w-2xl w-full p-4 sm:p-6 md:p-8 space-y-6 shadow-2xl relative max-h-[90vh] overflow-y-auto animate-in zoom-in-95 duration-200">
             <button
               onClick={() => setActiveModal(null)}
               className="absolute top-4 right-4 p-2 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 rounded-full hover:bg-gray-100 dark:hover:bg-gray-800 transition-all cursor-pointer"
@@ -1171,6 +1504,47 @@ export default function App() {
                   Apply
                 </button>
               </form>
+            </div>
+
+            {/* Badges panel — all acquirable badges; earned ones in colour,
+                hover shows how to earn each. */}
+            <div className="space-y-3 pt-5 border-t border-gray-100 dark:border-gray-800">
+              <h4 className="text-xs font-bold text-[#717171] dark:text-gray-400 uppercase tracking-wider flex items-center gap-1.5">
+                <Award className="w-4 h-4 text-amber-500" />
+                Badges
+                <span className="ml-1 text-[10px] text-gray-400 normal-case tracking-normal">
+                  {BADGES.filter((b) => b.earned(badgeStats)).length}/
+                  {BADGES.length} earned
+                </span>
+              </h4>
+              <div className="grid grid-cols-4 sm:grid-cols-8 gap-3">
+                {BADGES.map((b) => {
+                  const earned = b.earned(badgeStats);
+                  return (
+                    <div
+                      key={b.id}
+                      className="relative group flex flex-col items-center gap-1.5"
+                    >
+                      <BadgeMedal badge={b} earned={earned} size={46} />
+                      <span
+                        className="text-[8px] font-bold text-center leading-tight text-gray-600 dark:text-gray-400 w-full line-clamp-2"
+                        title={b.name}
+                      >
+                        {b.name}
+                      </span>
+                      <div className="pointer-events-none absolute bottom-full mb-2 left-1/2 -translate-x-1/2 w-44 z-30 opacity-0 group-hover:opacity-100 transition-opacity duration-150">
+                        <div className="bg-gray-900 dark:bg-gray-700 text-white text-[10px] leading-snug rounded-lg px-2.5 py-1.5 shadow-xl text-center">
+                          <span className="font-bold block mb-0.5">
+                            {b.name}
+                            {earned ? " · Earned ✓" : ""}
+                          </span>
+                          {b.requirement}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6 pt-2">
@@ -1312,7 +1686,7 @@ export default function App() {
       {/* My Reports List Modal */}
       {activeModal === "my-reports" && (
         <div className="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center p-4 z-50 animate-in fade-in duration-200">
-          <div className="bg-white dark:bg-gray-900 rounded-3xl border border-[#E5E5E5] dark:border-gray-800 max-w-4xl w-full p-6 md:p-8 space-y-6 shadow-2xl relative max-h-[90vh] overflow-y-auto animate-in zoom-in-95 duration-200">
+          <div className="bg-white dark:bg-gray-900 rounded-3xl border border-[#E5E5E5] dark:border-gray-800 max-w-4xl w-full p-4 sm:p-6 md:p-8 space-y-6 shadow-2xl relative max-h-[90vh] overflow-y-auto animate-in zoom-in-95 duration-200">
             <button
               onClick={() => setActiveModal(null)}
               className="absolute top-4 right-4 p-2 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 rounded-full hover:bg-gray-100 dark:hover:bg-gray-800 transition-all cursor-pointer"
@@ -1439,6 +1813,94 @@ export default function App() {
                       ))}
                   </tbody>
                 </table>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Notifications page */}
+      {activeModal === "notifications" && (
+        <div className="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center p-4 z-50 animate-in fade-in duration-200">
+          <div className="bg-white dark:bg-gray-900 rounded-3xl border border-[#E5E5E5] dark:border-gray-800 max-w-2xl w-full p-6 md:p-8 space-y-5 shadow-2xl relative max-h-[90vh] overflow-y-auto animate-in zoom-in-95 duration-200">
+            <button
+              onClick={() => setActiveModal(null)}
+              className="absolute top-4 right-4 p-2 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 rounded-full hover:bg-gray-100 dark:hover:bg-gray-800 transition-all cursor-pointer"
+              title="Close"
+            >
+              <X className="w-5 h-5" />
+            </button>
+
+            <div>
+              <h3 className="text-xl font-display font-bold tracking-tight text-gray-900 dark:text-white flex items-center gap-2">
+                <Bell className="w-5 h-5 text-red-500" />
+                Notifications
+              </h3>
+              <p className="text-xs text-[#717171] dark:text-gray-400 mt-1">
+                Status updates on every issue you've reported.
+              </p>
+            </div>
+
+            {userNotifications.length === 0 ? (
+              <div className="text-center py-16 bg-gray-50 dark:bg-gray-800/50 rounded-2xl border border-dashed border-gray-200 dark:border-gray-700 space-y-3">
+                <Bell className="w-10 h-10 text-gray-300 dark:text-gray-600 mx-auto" />
+                <p className="text-sm font-semibold text-gray-700 dark:text-gray-300">
+                  You're all caught up
+                </p>
+                <p className="text-xs text-gray-400 dark:text-gray-500 max-w-xs mx-auto">
+                  When the status of a report you filed changes, it'll show up here.
+                </p>
+              </div>
+            ) : (
+              <div className="space-y-2.5">
+                {userNotifications.map((n) => {
+                  const issue = n.issueId
+                    ? issues.find((i) => i.id === n.issueId)
+                    : undefined;
+                  const meta = {
+                    status: { label: "Status", Icon: Activity, cls: "text-blue-500 bg-blue-50 dark:bg-blue-900/30" },
+                    watch: { label: "Neighbourhood Watch", Icon: AlertCircle, cls: "text-amber-500 bg-amber-50 dark:bg-amber-900/30" },
+                    petition: { label: "Petition", Icon: FileText, cls: "text-rose-500 bg-rose-50 dark:bg-rose-900/30" },
+                    mission: { label: "Mission", Icon: Sparkles, cls: "text-emerald-500 bg-emerald-50 dark:bg-emerald-900/30" },
+                  }[n.kind];
+                  const KindIcon = meta.Icon;
+                  return (
+                    <div
+                      key={n.id}
+                      className="flex items-start gap-3 p-3 rounded-2xl border border-gray-100 dark:border-gray-800 bg-gray-50/60 dark:bg-gray-800/40 hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors"
+                    >
+                      <div
+                        className={`w-10 h-10 rounded-xl shrink-0 flex items-center justify-center ${meta.cls}`}
+                      >
+                        <KindIcon className="w-4 h-4" />
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <p className="text-[9px] font-bold uppercase tracking-widest text-gray-400 dark:text-gray-500">
+                          {meta.label}
+                        </p>
+                        <p className="text-sm text-gray-800 dark:text-gray-200 leading-snug">
+                          {n.message}
+                        </p>
+                        <span className="text-[10px] text-gray-400">
+                          {new Date(n.time).toLocaleString()}
+                        </span>
+                      </div>
+                      {issue && (
+                        <button
+                          onClick={() => {
+                            setSelectedIssueFromParent(issue);
+                            setActiveTab("map");
+                            setActiveModal(null);
+                          }}
+                          className="shrink-0 text-xs text-blue-600 dark:text-blue-400 hover:text-blue-800 font-bold uppercase tracking-wider flex items-center gap-1 cursor-pointer mt-1"
+                        >
+                          View
+                          <ChevronRight className="w-4 h-4" />
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
             )}
           </div>

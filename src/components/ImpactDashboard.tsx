@@ -3,20 +3,23 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect } from "react";
-import { db } from "../lib/firebase";
-import {
-  collection,
-  query,
-  orderBy,
-  limit,
-  onSnapshot,
-} from "firebase/firestore";
+import React, { useState, useMemo, useEffect } from "react";
+import type { User } from "firebase/auth";
+import { Sparkles, Target } from "lucide-react";
 import { CitizenProfile, LeaderboardEntry, CivicIssue } from "../types";
-import { calculateCivicRank } from "../lib/firebase";
+import {
+  calculateCivicRank,
+  computeImpactPoints,
+  computeReportsCount,
+  WELCOME_POINTS,
+  POINTS_PER_REPORT,
+  POINTS_PER_RESOLVED,
+} from "../lib/firebase";
+import { missions as buildMissions, nextRank } from "../lib/civic";
+import { BADGES, BadgeMedal, computeBadgeStats } from "./../lib/badges";
 
 interface ImpactProps {
-  currentUser: any;
+  currentUser: User | null;
   currentProfile: CitizenProfile | null;
   issues: CivicIssue[];
 }
@@ -26,39 +29,90 @@ export default function ImpactDashboard({
   currentProfile,
   issues,
 }: ImpactProps) {
-  const [leaderboard, setLeaderboard] = useState<LeaderboardEntry[]>([]);
-  const [loading, setLoading] = useState<boolean>(true);
   const [isGeneratingStory, setIsGeneratingStory] = useState(false);
   const [impactStory, setImpactStory] = useState<{
     title: string;
     story: string;
   } | null>(null);
 
-  // Derive counts live from issues
-  const userIssues = issues.filter(i => i.reportedByUid === currentUser?.uid);
-  const liveReportsCount = userIssues.length;
-  const liveImpactPoints = 20 + userIssues.reduce((sum, i) => sum + 10 + (i.status === "Resolved" ? 50 : 0), 0);
+  // Everything is derived from the live issues collection — one source of
+  // truth, so counts can never drift (purge/delete are automatically correct).
+  const liveReportsCount = currentUser
+    ? computeReportsCount(issues, currentUser.uid)
+    : 0;
+  const liveImpactPoints = currentUser
+    ? computeImpactPoints(issues, currentUser.uid)
+    : 0;
+  const liveResolvedCount = issues.filter(
+    (i) => i.reportedByUid === currentUser?.uid && i.status === "Resolved",
+  ).length;
   const liveCivicRank = calculateCivicRank(liveImpactPoints);
+  const badgeStats = computeBadgeStats(issues, currentUser?.uid, liveImpactPoints);
 
+  // Missions Coach (rule-based missions + an AI coaching line on top).
+  const myMissions = useMemo(
+    () =>
+      buildMissions(
+        issues,
+        currentUser?.uid,
+        liveImpactPoints,
+        currentProfile?.ward,
+      ),
+    [issues, currentUser?.uid, liveImpactPoints, currentProfile?.ward],
+  );
+  const [coach, setCoach] = useState<string>("");
   useEffect(() => {
-    const q = query(
-      collection(db, "citizens"),
-      orderBy("impactPoints", "desc"),
-      limit(10),
-    );
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const records: LeaderboardEntry[] = [];
-      snapshot.forEach((docSnap) =>
-        records.push({
-          uid: docSnap.id,
-          ...(docSnap.data() as Omit<LeaderboardEntry, "uid">),
-        }),
-      );
-      setLeaderboard(records);
-      setLoading(false);
-    });
-    return () => unsubscribe();
-  }, []);
+    if (!currentUser) return;
+    const nr = nextRank(liveImpactPoints);
+    const ctx = {
+      rank: liveCivicRank,
+      points: liveImpactPoints,
+      nextRank: nr?.title,
+      pointsToNext: nr?.needed,
+      ward: currentProfile?.ward,
+      openMissions: myMissions.map((m) => m.title),
+    };
+    let cancelled = false;
+    fetch("/api/missions-coach", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ context: ctx }),
+    })
+      .then((r) => r.json())
+      .then((d) => {
+        if (!cancelled && d.coach) setCoach(d.coach);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+    // Refresh when standing changes meaningfully.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [liveImpactPoints, myMissions.length]);
+
+  // Leaderboard aggregated from issues (not a stored counter).
+  const leaderboard = useMemo<LeaderboardEntry[]>(() => {
+    const byUser = new Map<string, LeaderboardEntry>();
+    for (const issue of issues) {
+      const existing = byUser.get(issue.reportedByUid) || {
+        uid: issue.reportedByUid,
+        displayName: issue.reportedByName || "Civic Hero",
+        impactPoints: WELCOME_POINTS,
+        civicRank: "Civic Novice",
+        reportsCount: 0,
+        ward: issue.ward,
+      };
+      existing.reportsCount += 1;
+      existing.impactPoints +=
+        POINTS_PER_REPORT + (issue.status === "Resolved" ? POINTS_PER_RESOLVED : 0);
+      if (issue.ward) existing.ward = issue.ward;
+      byUser.set(issue.reportedByUid, existing);
+    }
+    return Array.from(byUser.values())
+      .map((e) => ({ ...e, civicRank: calculateCivicRank(e.impactPoints) }))
+      .sort((a, b) => b.impactPoints - a.impactPoints)
+      .slice(0, 10);
+  }, [issues]);
 
   const generateStory = async () => {
     if (!currentProfile) return;
@@ -71,7 +125,7 @@ export default function ImpactDashboard({
         body: JSON.stringify({
           stats: {
             reports: liveReportsCount,
-            resolved: 0, // In a real app we'd fetch this from their issues
+            resolved: liveResolvedCount,
             points: liveImpactPoints,
           },
           language: "English",
@@ -122,19 +176,55 @@ export default function ImpactDashboard({
     : null;
 
   return (
+   <div className="space-y-5">
+    {/* AI Missions Coach */}
+    <div className="glass-card rounded-3xl p-6">
+      <div className="flex items-center gap-2 mb-3">
+        <div className="w-8 h-8 rounded-xl bg-emerald-50 dark:bg-emerald-900/30 flex items-center justify-center">
+          <Sparkles className="w-4 h-4 text-emerald-500" />
+        </div>
+        <h3 className="text-sm font-bold uppercase tracking-widest text-gray-700 dark:text-gray-200">
+          Your Missions
+        </h3>
+      </div>
+      {coach && (
+        <p className="text-sm text-gray-700 dark:text-gray-300 mb-4 leading-relaxed bg-emerald-50/60 dark:bg-emerald-900/15 border border-emerald-100 dark:border-emerald-800/40 rounded-2xl p-3">
+          {coach}
+        </p>
+      )}
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+        {myMissions.map((m) => (
+          <div
+            key={m.id}
+            className="p-4 rounded-2xl border border-gray-100 dark:border-gray-800 bg-gray-50/60 dark:bg-gray-800/40 flex flex-col gap-1.5"
+          >
+            <div className="flex items-center gap-1.5 text-primary">
+              <Target className="w-3.5 h-3.5" />
+              <p className="text-xs font-bold text-gray-900 dark:text-white">
+                {m.title}
+              </p>
+            </div>
+            <p className="text-[11px] text-gray-500 dark:text-gray-400 leading-snug">
+              {m.detail}
+            </p>
+          </div>
+        ))}
+      </div>
+    </div>
+
     <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
       <div className="md:col-span-1 glass-card flex flex-col rounded-3xl overflow-hidden mt-2">
         <div className="p-6 border-b border-[#E5E5E5] dark:border-gray-800">
           <div className="flex justify-between items-end mb-4">
             <div>
-              <h2 className="text-3xl font-display font-bold tracking-tight text-[#1A1A1A] dark:text-white mb-1">
+              <h2 className="text-2xl sm:text-3xl font-display font-bold tracking-tight text-[#1A1A1A] dark:text-white mb-1">
                 Your Impact
               </h2>
               <p className="text-sm text-[#717171] dark:text-gray-400">
                 {currentProfile?.displayName}
               </p>
             </div>
-            <div className="text-3xl font-light text-primary">
+            <div className="text-2xl sm:text-3xl font-light text-primary shrink-0">
               {liveImpactPoints}{" "}
               <span className="text-sm font-bold text-semantic-success">
                 pts
@@ -190,7 +280,7 @@ export default function ImpactDashboard({
             </div>
             <div className="p-4 rounded-2xl bg-white dark:bg-gray-900 border border-[#E5E5E5] dark:border-gray-700 flex flex-col items-center justify-center text-center shadow-sm">
               <span className="text-2xl text-[#1A1A1A] dark:text-white font-light mb-1">
-                {liveImpactPoints > 0 ? Math.floor(liveImpactPoints / 10) : 0}
+                {liveResolvedCount}
               </span>
               <span className="text-[10px] uppercase tracking-widest font-bold text-[#717171] dark:text-gray-400">
                 Resolved
@@ -199,28 +289,40 @@ export default function ImpactDashboard({
           </div>
 
           <div>
-            <h4 className="text-[10px] font-bold text-gray-500 dark:text-gray-400 uppercase tracking-widest mb-3">
-              Achievements
+            <h4 className="text-[10px] font-bold text-gray-500 dark:text-gray-400 uppercase tracking-widest mb-3 flex items-center gap-1.5">
+              Badges
+              <span className="normal-case tracking-normal text-gray-400">
+                {BADGES.filter((b) => b.earned(badgeStats)).length}/
+                {BADGES.length}
+              </span>
             </h4>
-            <div className="flex flex-wrap gap-4">
-              <div className="flex flex-col items-center gap-2">
-                <div className={`w-14 h-14 rounded-full flex items-center justify-center text-2xl border-2 transition-all ${liveReportsCount > 0 ? "bg-emerald-50 border-emerald-200 dark:bg-emerald-900/30 dark:border-emerald-800 shadow-sm scale-100" : "bg-gray-100 border-gray-200 dark:bg-gray-800 dark:border-gray-700 opacity-50 grayscale scale-95"}`} title="First Report">
-                  🌱
-                </div>
-                <span className="text-[9px] font-bold uppercase tracking-widest text-gray-500 dark:text-gray-400 text-center w-16 leading-tight">First Report</span>
-              </div>
-              <div className="flex flex-col items-center gap-2">
-                <div className={`w-14 h-14 rounded-full flex items-center justify-center text-2xl border-2 transition-all ${liveReportsCount >= 5 ? "bg-amber-50 border-amber-200 dark:bg-amber-900/30 dark:border-amber-800 shadow-sm scale-100" : "bg-gray-100 border-gray-200 dark:bg-gray-800 dark:border-gray-700 opacity-50 grayscale scale-95"}`} title="Streak Keeper">
-                  🔥
-                </div>
-                <span className="text-[9px] font-bold uppercase tracking-widest text-gray-500 dark:text-gray-400 text-center w-16 leading-tight">Streak Keeper</span>
-              </div>
-              <div className="flex flex-col items-center gap-2">
-                <div className={`w-14 h-14 rounded-full flex items-center justify-center text-2xl border-2 transition-all ${liveImpactPoints >= 100 ? "bg-blue-50 border-blue-200 dark:bg-blue-900/30 dark:border-blue-800 shadow-sm scale-100" : "bg-gray-100 border-gray-200 dark:bg-gray-800 dark:border-gray-700 opacity-50 grayscale scale-95"}`} title="Pothole Hunter">
-                  🕵️
-                </div>
-                <span className="text-[9px] font-bold uppercase tracking-widest text-gray-500 dark:text-gray-400 text-center w-16 leading-tight">Pothole Hunter</span>
-              </div>
+            <div className="grid grid-cols-4 gap-x-2 gap-y-3">
+              {BADGES.map((b) => {
+                const earned = b.earned(badgeStats);
+                return (
+                  <div
+                    key={b.id}
+                    className="relative group flex flex-col items-center gap-1.5"
+                  >
+                    <BadgeMedal badge={b} earned={earned} size={44} />
+                    <span
+                      className="text-[8px] font-bold text-center leading-tight text-gray-600 dark:text-gray-400 w-full line-clamp-2"
+                      title={b.name}
+                    >
+                      {b.name}
+                    </span>
+                    <div className="pointer-events-none absolute bottom-full mb-2 left-1/2 -translate-x-1/2 w-40 z-30 opacity-0 group-hover:opacity-100 transition-opacity duration-150">
+                      <div className="bg-gray-900 dark:bg-gray-700 text-white text-[10px] leading-snug rounded-lg px-2.5 py-1.5 shadow-xl text-center">
+                        <span className="font-bold block mb-0.5">
+                          {b.name}
+                          {earned ? " · Earned ✓" : ""}
+                        </span>
+                        {b.requirement}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           </div>
 
@@ -280,11 +382,9 @@ export default function ImpactDashboard({
           </div>
         </div>
 
-        {loading ? (
-          <div className="space-y-4">
-            <div className="h-12 bg-gray-100 dark:bg-gray-800 rounded-2xl animate-pulse" />
-            <div className="h-12 bg-gray-100 dark:bg-gray-800 rounded-2xl animate-pulse delay-75" />
-            <div className="h-12 bg-gray-100 dark:bg-gray-800 rounded-2xl animate-pulse delay-150" />
+        {leaderboard.length === 0 ? (
+          <div className="text-center py-12 text-gray-400 dark:text-gray-500 text-sm">
+            No reports yet — be the first to put your ward on the board.
           </div>
         ) : (
           <div className="overflow-x-auto">
@@ -334,5 +434,6 @@ export default function ImpactDashboard({
         )}
       </div>
     </div>
+   </div>
   );
 }

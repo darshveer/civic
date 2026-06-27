@@ -2,6 +2,21 @@
 
 @custom-variant dark (&:where(.dark, .dark *));
 
+/* Click ripple for the cursor flourish (CursorFx). */
+@keyframes civic-ripple {
+  from {
+    transform: scale(1);
+    opacity: 0.55;
+  }
+  to {
+    transform: scale(12);
+    opacity: 0;
+  }
+}
+.animate-civic-ripple {
+  animation: civic-ripple 0.65s ease-out forwards;
+}
+
 @theme {
   --font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
   --font-display: "Clash Display", ui-sans-serif, system-ui, sans-serif;

@@ -13,21 +13,80 @@ import {
   Mic,
   StopCircle,
 } from "lucide-react";
-import { db, incrementReportsCount, rewardImpactPoints } from "../lib/firebase";
+import ExifReader from "exifreader";
+import { db } from "../lib/firebase";
+import { loadWardsConfig, zoneForWard } from "../lib/roles";
 import {
   collection,
   addDoc,
   doc,
   updateDoc,
-  increment,
 } from "firebase/firestore";
-import { TriageResult, CivicIssue } from "../types";
+import type { User } from "firebase/auth";
+import { TriageResult, CivicIssue, MetadataMode } from "../types";
 import { useMapsLibrary, Map as GoogleMap, AdvancedMarker, Pin, useMap } from "@vis.gl/react-google-maps";
 
 interface ReporterProps {
-  onSuccess: (newIssue: any) => void;
-  currentUser: any;
+  onSuccess: (newIssue: CivicIssue) => void;
+  currentUser: User | null;
   isDarkMode?: boolean;
+}
+
+interface ParsedGeo {
+  address: string;
+  ward: string;
+  city: string;
+  state: string;
+}
+
+/** Extracts a usable address + administrative geography from a geocode result. */
+function parseGeocode(result: google.maps.GeocoderResult): ParsedGeo {
+  const find = (types: string[]) =>
+    result.address_components.find((c) =>
+      types.some((t) => c.types.includes(t)),
+    );
+  const ward =
+    find(["sublocality", "neighborhood"])?.short_name ||
+    find(["locality"])?.short_name ||
+    "";
+  const city =
+    find(["locality", "administrative_area_level_2"])?.long_name || "";
+  const state = find(["administrative_area_level_1"])?.long_name || "";
+  return { address: result.formatted_address, ward, city, state };
+}
+
+/**
+ * LAYER 1 — Parses embedded EXIF metadata from an image file binary.
+ * Returns the original capture GPS coordinates and timestamp when the photo
+ * carries them (location services were ON at capture), or null when the EXIF
+ * GPS block is absent (e.g. location privacy was off, or the file was stripped).
+ */
+async function parseExifTelemetry(
+  file: File,
+): Promise<{ latitude: number; longitude: number; capturedAt: number | null } | null> {
+  try {
+    const buffer = await file.arrayBuffer();
+    const tags = ExifReader.load(buffer, { expanded: true });
+    const lat = tags.gps?.Latitude;
+    const lng = tags.gps?.Longitude;
+    if (typeof lat !== "number" || typeof lng !== "number") return null;
+
+    // DateTimeOriginal is "YYYY:MM:DD HH:MM:SS" — normalise to an epoch ms.
+    let capturedAt: number | null = null;
+    const original = tags.exif?.DateTimeOriginal?.description;
+    if (typeof original === "string") {
+      const iso = original.replace(
+        /^(\d{4}):(\d{2}):(\d{2})/,
+        "$1-$2-$3",
+      );
+      const parsed = Date.parse(iso);
+      if (!Number.isNaN(parsed)) capturedAt = parsed;
+    }
+    return { latitude: lat, longitude: lng, capturedAt };
+  } catch (e) {
+    console.warn("EXIF parse failed; will fall back to live location.", e);
+    return null;
+  }
 }
 
 const API_KEY =
@@ -55,11 +114,50 @@ function ReporterInner({ onSuccess, currentUser, isDarkMode }: ReporterProps) {
     longitude: number;
     address?: string;
     ward?: string;
+    city?: string;
+    state?: string;
   } | null>(null);
   const [locatingState, setLocatingState] = useState<
     "idle" | "tracking" | "success" | "failed"
   >("idle");
   const [geolocError, setGeolocError] = useState<string | null>(null);
+
+  type PermState = "unknown" | "granted" | "denied" | "prompt";
+  const [cameraPermission, setCameraPermission] = useState<PermState>("unknown");
+  const [locationPermission, setLocationPermission] =
+    useState<PermState>("unknown");
+  // Camera + geolocation only work in a secure context (https or localhost).
+  const isSecureContext =
+    typeof window === "undefined" ? true : window.isSecureContext;
+
+  /**
+   * Pre-warms the camera permission so the browser prompt appears up front.
+   * Immediately stops the stream — we only want the grant, not a live feed.
+   * (Safari needs a user gesture, so this is also wired to a button.)
+   */
+  const requestCameraAccess = async (): Promise<boolean> => {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setCameraPermission("denied");
+      return false;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "environment" },
+      });
+      stream.getTracks().forEach((t) => t.stop());
+      setCameraPermission("granted");
+      return true;
+    } catch (e) {
+      setCameraPermission("denied");
+      return false;
+    }
+  };
+
+  // Request BOTH permissions up front, and re-trigger via the banner button.
+  const requestAllPermissions = () => {
+    requestLocation();
+    requestCameraAccess();
+  };
 
   const geocodingLib = useMapsLibrary("geocoding");
   const placesLib = useMapsLibrary("places");
@@ -71,16 +169,59 @@ function ReporterInner({ onSuccess, currentUser, isDarkMode }: ReporterProps) {
     status: string;
     isCorroborated: boolean;
     corroboratedGroupId: string | null;
+    targetIssueId?: string | null;
+  } | null>(null);
+
+  // --- LAYER 1: Citizen telemetry (how the pin coordinates were sourced) ---
+  const [metadataMode, setMetadataMode] = useState<MetadataMode | null>(null);
+  const [captureTimestamp, setCaptureTimestamp] = useState<number | null>(null);
+
+  // --- LAYER 2/3: Gemini forensics + spatial consensus result ---
+  const [verifyOutput, setVerifyOutput] = useState<{
+    forensics: {
+      isAuthentic: boolean;
+      fraudConfidenceScore: number;
+      visualEvidenceTags: string[];
+      flagged: boolean;
+    };
+    consensus: {
+      communityVerified: boolean;
+      matchedIssueId: string | null;
+      corroboratedGroupId: string | null;
+    };
   } | null>(null);
 
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
   const [isDone, setIsDone] = useState<boolean>(false);
+  const [wasDuplicate, setWasDuplicate] = useState<boolean>(false);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
+    // Proactively ask for location AND camera as soon as the reporter opens.
     requestLocation();
+    requestCameraAccess();
+
+    // Reflect live permission state where the Permissions API is supported.
+    const perms = navigator.permissions;
+    if (perms?.query) {
+      perms
+        .query({ name: "geolocation" as PermissionName })
+        .then((p) => {
+          setLocationPermission(p.state as PermState);
+          p.onchange = () => setLocationPermission(p.state as PermState);
+        })
+        .catch(() => {});
+      perms
+        .query({ name: "camera" as PermissionName })
+        .then((p) => {
+          setCameraPermission(p.state as PermState);
+          p.onchange = () => setCameraPermission(p.state as PermState);
+        })
+        .catch(() => {});
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -92,16 +233,8 @@ function ReporterInner({ onSuccess, currentUser, isDarkMode }: ReporterProps) {
             location: { lat: location.latitude, lng: location.longitude },
           });
           if (result.results[0]) {
-            let address = result.results[0].formatted_address;
-            let ward = "";
-            const sublocality = result.results[0].address_components.find(c => c.types.includes("sublocality") || c.types.includes("neighborhood"));
-            if (sublocality) {
-              ward = sublocality.short_name;
-            } else {
-              const locality = result.results[0].address_components.find(c => c.types.includes("locality"));
-              if (locality) ward = locality.short_name;
-            }
-            setLocation(prev => prev ? { ...prev, address, ward } : prev);
+            const geo = parseGeocode(result.results[0]);
+            setLocation((prev) => (prev ? { ...prev, ...geo } : prev));
           }
         } catch (e) {
           console.error("Geocoding fetch failed", e);
@@ -121,25 +254,14 @@ function ReporterInner({ onSuccess, currentUser, isDarkMode }: ReporterProps) {
     setGeolocError(null);
     navigator.geolocation.getCurrentPosition(
       async (position) => {
-        let address = "";
-        let ward = "";
+        let geo: ParsedGeo = { address: "", ward: "", city: "", state: "" };
         if (geocodingLib) {
           const geocoder = new geocodingLib.Geocoder();
           try {
             const result = await geocoder.geocode({
               location: { lat: position.coords.latitude, lng: position.coords.longitude },
             });
-            if (result.results[0]) {
-              address = result.results[0].formatted_address;
-              // Simple extraction of a neighborhood/sublocality for ward
-              const sublocality = result.results[0].address_components.find(c => c.types.includes("sublocality") || c.types.includes("neighborhood"));
-              if (sublocality) {
-                ward = sublocality.short_name;
-              } else {
-                const locality = result.results[0].address_components.find(c => c.types.includes("locality"));
-                if (locality) ward = locality.short_name;
-              }
-            }
+            if (result.results[0]) geo = parseGeocode(result.results[0]);
           } catch (e) {
             console.error("Geocoding failed", e);
           }
@@ -147,8 +269,7 @@ function ReporterInner({ onSuccess, currentUser, isDarkMode }: ReporterProps) {
         setLocation({
           latitude: position.coords.latitude,
           longitude: position.coords.longitude,
-          address,
-          ward,
+          ...geo,
         });
         setLocatingState("success");
       },
@@ -170,10 +291,14 @@ function ReporterInner({ onSuccess, currentUser, isDarkMode }: ReporterProps) {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: "environment" },
       });
+      setCameraPermission("granted");
       if (videoRef.current) videoRef.current.srcObject = stream;
     } catch (err) {
       setIsCapturing(false);
-      setTriageError("Camera error. Please upload a file.");
+      setCameraPermission("denied");
+      setTriageError(
+        "Camera access was blocked. Allow camera in your browser's site settings, or upload a file instead.",
+      );
     }
   };
 
@@ -187,6 +312,11 @@ function ReporterInner({ onSuccess, currentUser, isDarkMode }: ReporterProps) {
         ctx.drawImage(videoRef.current, 0, 0, canvas.width, canvas.height);
         const dataUrl = canvas.toDataURL("image/jpeg");
         setImagePreview(dataUrl);
+        // Canvas capture strips EXIF, so an in-app photo always uses the live
+        // device location (Layer 1 fallback path).
+        setMetadataMode("Live-Fallback");
+        setCaptureTimestamp(null);
+        setVerifyOutput(null);
         fetch(dataUrl)
           .then((res) => res.blob())
           .then((blob) =>
@@ -209,14 +339,34 @@ function ReporterInner({ onSuccess, currentUser, isDarkMode }: ReporterProps) {
     setIsCapturing(false);
   };
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
       const file = e.target.files[0];
       setSelectedFile(file);
       setTriageOutput(null);
+      setVerifyOutput(null);
       const reader = new FileReader();
       reader.onload = () => setImagePreview(reader.result as string);
       reader.readAsDataURL(file);
+
+      // LAYER 1: prefer the photo's ORIGINAL capture coordinates (EXIF) so the
+      // map pin reflects where/when the issue was actually photographed — even
+      // if the citizen uploads it later from a different place.
+      const exif = await parseExifTelemetry(file);
+      if (exif) {
+        setMetadataMode("Historical-EXIF");
+        setCaptureTimestamp(exif.capturedAt);
+        // Setting location WITHOUT an address lets the geocoding effect reverse-
+        // geocode the EXIF point into ward/city/state.
+        setLocation({ latitude: exif.latitude, longitude: exif.longitude });
+        setLocatingState("success");
+        setGeolocError(null);
+      } else {
+        // No embedded GPS → fall back to the browser's live location.
+        setMetadataMode("Live-Fallback");
+        setCaptureTimestamp(null);
+        if (!location) requestLocation();
+      }
     }
   };
 
@@ -245,21 +395,18 @@ function ReporterInner({ onSuccess, currentUser, isDarkMode }: ReporterProps) {
         const geocoder = new geocodingLib.Geocoder();
         const result = await geocoder.geocode({ location: { lat, lng } });
         if (result.results[0]) {
-           let address = result.results[0].formatted_address;
-           let ward = "";
-           const sublocality = result.results[0].address_components.find(c => c.types.includes("sublocality") || c.types.includes("neighborhood"));
-           if (sublocality) ward = sublocality.short_name;
-           else {
-             const locality = result.results[0].address_components.find(c => c.types.includes("locality"));
-             if (locality) ward = locality.short_name;
-           }
-           setLocation(prev => prev ? { ...prev, address, ward } : prev);
+          const geo = parseGeocode(result.results[0]);
+          setLocation((prev) => (prev ? { ...prev, ...geo } : prev));
         } else {
-           setLocation(prev => prev ? { ...prev, address: "Address not found for this location." } : prev);
+          setLocation((prev) =>
+            prev ? { ...prev, address: "Address not found for this location." } : prev,
+          );
         }
       } catch (e) {
-         console.error("Geocoding failed", e);
-         setLocation(prev => prev ? { ...prev, address: "Network error: couldn't fetch address." } : prev);
+        console.error("Geocoding failed", e);
+        setLocation((prev) =>
+          prev ? { ...prev, address: "Network error: couldn't fetch address." } : prev,
+        );
       }
     }
   };
@@ -364,9 +511,27 @@ function ReporterInner({ onSuccess, currentUser, isDarkMode }: ReporterProps) {
         }).then((res) => res.json());
       }
 
-      const [triageData, descData] = await Promise.all([
+      // LAYER 2 + LAYER 3 (Rule A): run cognitive forensics + spatial consensus
+      // in parallel with triage. Fails soft — a verify error must not block the
+      // report (it just lands as "Pending Verification").
+      const verifyPromise = fetch("/api/reports/verify", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          image: imagePreview,
+          mimeType: selectedFile?.type || "image/jpeg",
+          latitude: location.latitude,
+          longitude: location.longitude,
+          reporterUid: currentUser?.uid || null,
+        }),
+      })
+        .then((res) => res.json())
+        .catch(() => null);
+
+      const [triageData, descData, verifyData] = await Promise.all([
         triagePromise,
         descPromise,
+        verifyPromise,
       ]);
 
       if (triageData.error) throw new Error(triageData.error);
@@ -374,6 +539,12 @@ function ReporterInner({ onSuccess, currentUser, isDarkMode }: ReporterProps) {
       clearInterval(interval);
       setTriageStep(5);
       setTriageOutput(triageData);
+      if (verifyData && verifyData.success) {
+        setVerifyOutput({
+          forensics: verifyData.forensics,
+          consensus: verifyData.consensus,
+        });
+      }
       setEditedDescription(
         descData?.description || triageData.triage.autoGeneratedDescription,
       );
@@ -394,46 +565,91 @@ function ReporterInner({ onSuccess, currentUser, isDarkMode }: ReporterProps) {
     }
     setIsSubmitting(true);
     try {
-      if (triageOutput.isCorroborated && triageOutput.targetIssueId) {
-        // Merge into existing cluster
-        const issueRef = doc(db, "issues", triageOutput.targetIssueId);
-        await updateDoc(issueRef, {
-          duplicateCount: increment(1),
-        });
-      } else {
-        // Create new report
-        const issueData: Omit<CivicIssue, "id"> = {
-          imageUrl: imagePreview || "",
-          category: triageOutput?.triage?.category || "Other",
-          severityScore: triageOutput?.triage?.severityScore ?? 5,
-          confidencePercentage:
-            triageOutput?.triage?.confidencePercentage ?? 50,
-          recommendedDepartment:
-            triageOutput?.triage?.recommendedDepartment || "General Operations",
-          description: editedDescription || "Reported civic issue.",
-          priorityTier: triageOutput?.triage?.priorityTier || "P3",
-          slaTargetHours: triageOutput?.triage?.slaTargetHours || 72,
-          duplicateCount: 1,
-          ...location,
-          reportedByUid: currentUser.uid,
-          reportedByName: currentUser.displayName || "Civic Hero",
-          reportedAt: Date.now(),
-          status: triageOutput.status as any,
-          upvotesCount: 0,
-          isCorroborated: false,
-          corroboratedGroupId: null,
-        };
-        const docRef = await addDoc(collection(db, "issues"), issueData);
-        onSuccess({ id: docRef.id, ...issueData });
+      // --- Resolve the Trust & Verification Engine outcome ----------------
+      // A flagged image is parked for review; otherwise, if an independent
+      // nearby report corroborates this one (Rule A — from forensics consensus,
+      // or the triage 50m detector as a fallback when forensics was down), both
+      // points become "Community Verified". Failing that, it enters the trust
+      // track as "Pending Verification".
+      const flagged = verifyOutput?.forensics.flagged ?? false;
+      const matchedIssueId =
+        verifyOutput?.consensus.matchedIssueId ??
+        (triageOutput.isCorroborated ? triageOutput.targetIssueId ?? null : null);
+      const corroboratedGroupId =
+        verifyOutput?.consensus.corroboratedGroupId ??
+        triageOutput.corroboratedGroupId ??
+        null;
+      const communityVerified = !flagged && Boolean(matchedIssueId);
+
+      let trustStatus: CivicIssue["status"];
+      if (flagged) trustStatus = "Flagged for Review";
+      else if (communityVerified) trustStatus = "Community Verified";
+      else trustStatus = "Pending Verification";
+
+      // Stamp the zone from the ward→zone map so staff hierarchy scoping works.
+      const wards = await loadWardsConfig();
+      const zone = zoneForWard(location.ward, wards) || "";
+      const issueData: Omit<CivicIssue, "id"> = {
+        imageUrl: imagePreview || "",
+        category: triageOutput.triage.category || "Other",
+        severityScore: triageOutput.triage.severityScore ?? 5,
+        confidencePercentage: triageOutput.triage.confidencePercentage ?? 50,
+        recommendedDepartment:
+          triageOutput.triage.recommendedDepartment || "General Operations",
+        description: editedDescription || "Reported civic issue.",
+        priorityTier: triageOutput.triage.priorityTier || "P3",
+        slaTargetHours: triageOutput.triage.slaTargetHours || 72,
+        ...(triageOutput.triage.urgencyReasoning
+          ? { urgencyReasoning: triageOutput.triage.urgencyReasoning }
+          : {}),
+        duplicateCount: 1,
+        escalationLevel: 0,
+        ...location,
+        zone,
+        reportedByUid: currentUser.uid,
+        reportedByName: currentUser.displayName || "Civic Hero",
+        reportedAt: Date.now(),
+        status: trustStatus,
+        upvotesCount: 0,
+        isCorroborated: communityVerified,
+        corroboratedGroupId: communityVerified ? corroboratedGroupId : null,
+        // LAYER 1 telemetry
+        metadataMode: metadataMode ?? "Live-Fallback",
+        metadataWarning: (metadataMode ?? "Live-Fallback") === "Live-Fallback",
+        ...(captureTimestamp ? { captureTimestamp } : {}),
+        // LAYER 2 forensics
+        ...(verifyOutput
+          ? {
+              isAuthentic: verifyOutput.forensics.isAuthentic,
+              fraudConfidenceScore: verifyOutput.forensics.fraudConfidenceScore,
+              visualEvidenceTags: verifyOutput.forensics.visualEvidenceTags,
+            }
+          : {}),
+      };
+      const docRef = await addDoc(collection(db, "issues"), issueData);
+
+      // RULE A dual-write: promote the matched (other citizen's) report too.
+      // Authorized by the `isValidCommunityVerification()` Firestore rule. Wrapped
+      // so a permission hiccup never fails the citizen's own submission.
+      if (communityVerified && matchedIssueId) {
+        try {
+          await updateDoc(doc(db, "issues", matchedIssueId), {
+            status: "Community Verified",
+            isCorroborated: true,
+            corroboratedGroupId: corroboratedGroupId ?? matchedIssueId,
+          });
+        } catch (e) {
+          console.warn("Community-verification dual-write skipped:", e);
+        }
       }
 
-      await rewardImpactPoints(currentUser.uid, 10);
-      await incrementReportsCount(currentUser.uid);
-      setIsDone(true);
+      setWasDuplicate(communityVerified);
+      onSuccess({ id: docRef.id, ...issueData });
 
+      setIsDone(true);
       setTimeout(resetForm, 4000);
-    } catch (err: any) {
-      setTriageError(err.message);
+    } catch (err) {
+      setTriageError(err instanceof Error ? err.message : "Submission failed.");
     } finally {
       setIsSubmitting(false);
     }
@@ -443,16 +659,29 @@ function ReporterInner({ onSuccess, currentUser, isDarkMode }: ReporterProps) {
     setSelectedFile(null);
     setImagePreview(null);
     setTriageOutput(null);
+    setVerifyOutput(null);
+    setMetadataMode(null);
+    setCaptureTimestamp(null);
     setTriageError(null);
     setLocationError(null);
     setIsLocationConfirmed(false);
     setIsDone(false);
+    setWasDuplicate(false);
     stopCamera();
   };
 
+  const cameraReady = cameraPermission === "granted";
+  const locationReady =
+    locationPermission === "granted" || locatingState === "success";
+  const showPermissionBanner =
+    !isSecureContext || !cameraReady || !locationReady;
+
   return (
-    <div className="glass-card rounded-3xl overflow-hidden max-w-2xl mx-auto mt-2">
-      <div className="p-6 border-b border-[#E5E5E5] dark:border-gray-800 flex justify-between items-center bg-white/50 dark:bg-gray-900/50">
+    // Vertically + horizontally centre the reporter card in the available space
+    // (it previously hugged the top of the page).
+    <div className="min-h-[72vh] flex items-center justify-center">
+    <div className="glass-card rounded-3xl overflow-hidden max-w-2xl w-full mx-auto">
+      <div className="p-4 sm:p-6 border-b border-[#E5E5E5] dark:border-gray-800 flex justify-between items-center gap-2 bg-white/50 dark:bg-gray-900/50">
         <div>
           <h2 className="text-2xl font-display font-bold tracking-tight text-[#1A1A1A] dark:text-white">
             Civic Reporter
@@ -474,10 +703,88 @@ function ReporterInner({ onSuccess, currentUser, isDarkMode }: ReporterProps) {
         </div>
       </div>
 
-      <div className="p-6 md:p-8 space-y-6">
+      <div className="p-4 sm:p-6 md:p-8 space-y-6">
         {geolocError && (
           <div className="text-xs text-semantic-danger p-3 rounded-xl bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50">
             {geolocError}
+          </div>
+        )}
+
+        {/* LAYER 1: telemetry-source indicator (EXIF vs live fallback). */}
+        {imagePreview && metadataMode && (
+          <div
+            className={`flex items-start gap-2 text-[11px] p-2.5 rounded-xl border ${
+              metadataMode === "Historical-EXIF"
+                ? "bg-emerald-50 dark:bg-emerald-900/20 border-emerald-200 dark:border-emerald-800/50 text-emerald-700 dark:text-emerald-400"
+                : "bg-amber-50 dark:bg-amber-900/20 border-amber-200 dark:border-amber-800/50 text-amber-700 dark:text-amber-400"
+            }`}
+          >
+            <MapPin className="w-3.5 h-3.5 mt-0.5 shrink-0" />
+            <span>
+              {metadataMode === "Historical-EXIF" ? (
+                <>
+                  <strong>Original capture location</strong> read from photo EXIF
+                  {captureTimestamp
+                    ? ` · taken ${new Date(captureTimestamp).toLocaleString()}`
+                    : ""}
+                  .
+                </>
+              ) : (
+                <>
+                  <strong>Live device location</strong> — this photo has no GPS
+                  EXIF, so we used your current position.
+                </>
+              )}
+            </span>
+          </div>
+        )}
+
+        {showPermissionBanner && (
+          <div className="p-4 rounded-2xl border border-amber-200 dark:border-amber-800/50 bg-amber-50 dark:bg-amber-900/20">
+            {!isSecureContext ? (
+              <p className="text-xs text-amber-800 dark:text-amber-300 leading-relaxed">
+                <strong>Camera & location need a secure connection.</strong>{" "}
+                Open the app over <code>https</code> or{" "}
+                <code>http://localhost:3000</code> (not a raw IP address) so your
+                browser can grant these permissions.
+              </p>
+            ) : (
+              <div className="flex flex-col sm:flex-row sm:items-center gap-3">
+                <div className="flex-1">
+                  <p className="text-xs font-bold text-amber-800 dark:text-amber-300 mb-1.5">
+                    This report needs camera & location access
+                  </p>
+                  <div className="flex flex-wrap gap-3 text-[11px] font-semibold">
+                    <span
+                      className={`inline-flex items-center gap-1 ${locationReady ? "text-emerald-600 dark:text-emerald-400" : "text-amber-700 dark:text-amber-400"}`}
+                    >
+                      <MapPin className="w-3.5 h-3.5" />
+                      Location {locationReady ? "granted ✓" : "needed"}
+                    </span>
+                    <span
+                      className={`inline-flex items-center gap-1 ${cameraReady ? "text-emerald-600 dark:text-emerald-400" : "text-amber-700 dark:text-amber-400"}`}
+                    >
+                      <Camera className="w-3.5 h-3.5" />
+                      Camera {cameraReady ? "granted ✓" : "needed"}
+                    </span>
+                  </div>
+                  {(cameraPermission === "denied" ||
+                    locationPermission === "denied") && (
+                    <p className="text-[10px] text-amber-700 dark:text-amber-400 mt-1.5">
+                      If you previously blocked access, enable it in your
+                      browser's site settings (the 🔒 icon in the address bar),
+                      then tap below.
+                    </p>
+                  )}
+                </div>
+                <button
+                  onClick={requestAllPermissions}
+                  className="shrink-0 bg-amber-500 hover:bg-amber-600 text-white font-bold text-xs py-2.5 px-4 rounded-full uppercase tracking-wider transition-colors cursor-pointer min-h-[44px]"
+                >
+                  Enable Access
+                </button>
+              </div>
+            )}
           </div>
         )}
 
@@ -485,14 +792,14 @@ function ReporterInner({ onSuccess, currentUser, isDarkMode }: ReporterProps) {
           <div className="grid grid-cols-2 gap-4">
             <button
               onClick={startCamera}
-              className="border border-[#E5E5E5] dark:border-gray-700 hover:border-primary dark:hover:border-primary rounded-3xl p-8 flex flex-col items-center justify-center transition-colors text-[#1A1A1A] dark:text-white bg-gray-50/50 dark:bg-gray-800/50 cursor-pointer"
+              className="border border-[#E5E5E5] dark:border-gray-700 hover:border-primary dark:hover:border-primary rounded-3xl p-5 sm:p-8 flex flex-col items-center justify-center transition-colors text-[#1A1A1A] dark:text-white bg-gray-50/50 dark:bg-gray-800/50 cursor-pointer"
             >
               <Camera className="w-8 h-8 mb-3 text-primary" />
               <span className="font-semibold text-sm">Open Camera</span>
             </button>
             <button
               onClick={() => fileInputRef.current?.click()}
-              className="border border-[#E5E5E5] dark:border-gray-700 hover:border-primary dark:hover:border-primary rounded-3xl p-8 flex flex-col items-center justify-center transition-colors text-[#1A1A1A] dark:text-white bg-gray-50/50 dark:bg-gray-800/50 cursor-pointer"
+              className="border border-[#E5E5E5] dark:border-gray-700 hover:border-primary dark:hover:border-primary rounded-3xl p-5 sm:p-8 flex flex-col items-center justify-center transition-colors text-[#1A1A1A] dark:text-white bg-gray-50/50 dark:bg-gray-800/50 cursor-pointer"
             >
               <Upload className="w-8 h-8 mb-3 text-primary" />
               <span className="font-semibold text-sm">Upload Image</span>
@@ -696,6 +1003,16 @@ function ReporterInner({ onSuccess, currentUser, isDarkMode }: ReporterProps) {
               </div>
             </div>
 
+            {triageOutput.triage.urgencyReasoning && (
+              <div className="-mt-2 flex items-start gap-2 text-[11px] text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800/50 rounded-xl p-2.5">
+                <Sparkles className="w-3.5 h-3.5 mt-0.5 shrink-0" />
+                <span>
+                  <strong>Ranked {triageOutput.triage.priorityTier || "P3"}:</strong>{" "}
+                  {triageOutput.triage.urgencyReasoning}
+                </span>
+              </div>
+            )}
+
             <div className="bg-white dark:bg-gray-900 p-4 rounded-2xl border border-[#E5E5E5] dark:border-gray-700 shadow-sm">
               <div className="text-[10px] text-gray-500 dark:text-gray-400 uppercase font-bold mb-1 tracking-widest">
                 Routing
@@ -709,6 +1026,59 @@ function ReporterInner({ onSuccess, currentUser, isDarkMode }: ReporterProps) {
                 </span>
               </div>
             </div>
+
+            {/* LAYER 2/3: Trust & Verification verdict (forensics + consensus). */}
+            {verifyOutput && (
+              <div
+                className={`p-4 rounded-2xl border shadow-sm ${
+                  verifyOutput.forensics.flagged
+                    ? "bg-red-50 dark:bg-red-950/30 border-red-200 dark:border-red-900/50"
+                    : verifyOutput.consensus.communityVerified
+                      ? "bg-blue-50 dark:bg-blue-950/30 border-blue-200 dark:border-blue-900/50"
+                      : "bg-gray-50 dark:bg-gray-900 border-gray-200 dark:border-gray-700"
+                }`}
+              >
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-[10px] text-gray-500 dark:text-gray-400 uppercase font-bold tracking-widest">
+                    Trust & Verification
+                  </span>
+                  <span
+                    className={`text-[10px] px-2.5 py-1 rounded-full font-bold uppercase shrink-0 ${
+                      verifyOutput.forensics.flagged
+                        ? "text-red-600 dark:text-red-400 bg-red-100 dark:bg-red-900/40"
+                        : verifyOutput.consensus.communityVerified
+                          ? "text-blue-600 dark:text-blue-400 bg-blue-100 dark:bg-blue-900/40"
+                          : "text-gray-600 dark:text-gray-400 bg-gray-100 dark:bg-gray-800"
+                    }`}
+                  >
+                    {verifyOutput.forensics.flagged
+                      ? "Flagged for Review"
+                      : verifyOutput.consensus.communityVerified
+                        ? "Community Verified"
+                        : "Pending Verification"}
+                  </span>
+                </div>
+                <p className="text-[11px] text-gray-600 dark:text-gray-300 mb-2">
+                  {verifyOutput.forensics.flagged
+                    ? `Image authenticity check failed (fraud score ${(verifyOutput.forensics.fraudConfidenceScore * 100).toFixed(0)}%). This report will be queued for staff review.`
+                    : verifyOutput.consensus.communityVerified
+                      ? "An independent nearby report corroborates this issue — auto-verified by the community."
+                      : `Image authenticated (fraud score ${(verifyOutput.forensics.fraudConfidenceScore * 100).toFixed(0)}%). Awaiting corroboration.`}
+                </p>
+                {verifyOutput.forensics.visualEvidenceTags.length > 0 && (
+                  <div className="flex flex-wrap gap-1.5">
+                    {verifyOutput.forensics.visualEvidenceTags.map((tag) => (
+                      <span
+                        key={tag}
+                        className="text-[10px] px-2 py-0.5 rounded-full bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-gray-600 dark:text-gray-300"
+                      >
+                        {tag}
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
 
             <div>
               <div className="text-[10px] text-gray-500 dark:text-gray-400 uppercase font-bold mb-2 tracking-widest">
@@ -812,14 +1182,17 @@ function ReporterInner({ onSuccess, currentUser, isDarkMode }: ReporterProps) {
           <div className="py-12 text-center flex flex-col items-center">
             <Check className="w-10 h-10 text-[#10B981] mb-4" />
             <h3 className="text-2xl font-display font-bold tracking-tight text-[#1A1A1A] dark:text-white">
-              Report Logged
+              {wasDuplicate ? "Community Verified" : "Report Logged"}
             </h3>
             <p className="text-[#10B981] text-xs font-bold uppercase tracking-widest mt-2">
-              +10 Civic Points
+              {wasDuplicate
+                ? "A nearby report corroborates yours — both verified"
+                : "+10 Civic Points"}
             </p>
           </div>
         )}
       </div>
+    </div>
     </div>
   );
 }

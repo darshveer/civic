@@ -14,7 +14,7 @@ import {
   updateProfile,
   User
 } from 'firebase/auth';
-import { 
+import {
   initializeFirestore,
   getFirestore,
   doc,
@@ -28,36 +28,177 @@ import {
   updateDoc,
   increment,
   limit,
-  getDocs
+  getDocs,
+  runTransaction
 } from 'firebase/firestore';
 import { CitizenProfile, CivicIssue } from '../types';
 
-// Load configurations directly from the config json injected in workspace
+// Load configuration. Prefer env vars (so you can point at YOUR OWN Firebase
+// project), falling back to the AI Studio-injected firebase-applet-config.json.
 import firebaseConfigJson from '../../firebase-applet-config.json';
 
+const env = (process as unknown as { env?: Record<string, string | undefined> }).env || {};
+
 const firebaseConfig = {
-  apiKey: firebaseConfigJson.apiKey,
-  authDomain: firebaseConfigJson.authDomain,
-  projectId: firebaseConfigJson.projectId,
-  storageBucket: firebaseConfigJson.storageBucket,
-  messagingSenderId: firebaseConfigJson.messagingSenderId,
-  appId: firebaseConfigJson.appId
+  apiKey: env.FIREBASE_API_KEY || firebaseConfigJson.apiKey,
+  authDomain:
+    env.FIREBASE_AUTH_DOMAIN ||
+    firebaseConfigJson.authDomain ||
+    `${env.FIREBASE_PROJECT_ID || firebaseConfigJson.projectId}.firebaseapp.com`,
+  projectId: env.FIREBASE_PROJECT_ID || firebaseConfigJson.projectId,
+  storageBucket: env.FIREBASE_STORAGE_BUCKET || firebaseConfigJson.storageBucket,
+  messagingSenderId:
+    env.FIREBASE_MESSAGING_SENDER_ID || firebaseConfigJson.messagingSenderId,
+  appId: env.FIREBASE_APP_ID || firebaseConfigJson.appId,
 };
 
 // Initialize Firebase App gracefully
 const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApp();
 
-// Initialize Firestore targeting the specific custom database assigned in config
-const db = initializeFirestore(app, {}, firebaseConfigJson.firestoreDatabaseId || '(default)');
+// Target the Firestore database id (env override → JSON → default).
+const db = initializeFirestore(
+  app,
+  {},
+  env.FIREBASE_DATABASE_ID || firebaseConfigJson.firestoreDatabaseId || '(default)',
+);
 
 // Initialize Auth
 const auth = getAuth(app);
 
 export { auth, db };
 
+// ---------------------------------------------------------------------------
+// Gamification: single source of truth.
+//
+// Points and report counts are ALWAYS derived from the live `issues`
+// collection — never from denormalized counters on the citizen doc. This makes
+// purge/delete automatically consistent (deleting issues removes their points)
+// and keeps every surface (header, dashboard, leaderboard) in agreement.
+// ---------------------------------------------------------------------------
+
+export const WELCOME_POINTS = 20;
+export const POINTS_PER_REPORT = 10;
+export const POINTS_PER_RESOLVED = 50;
+
+/** Number of genuine reports a user has authored. */
+export function computeReportsCount(issues: CivicIssue[], uid: string): number {
+  return issues.filter((i) => i.reportedByUid === uid).length;
+}
+
+/** Live impact points for a user, derived from their issues. */
+export function computeImpactPoints(issues: CivicIssue[], uid: string): number {
+  return issues
+    .filter((i) => i.reportedByUid === uid)
+    .reduce(
+      (sum, i) =>
+        sum + POINTS_PER_REPORT + (i.status === "Resolved" ? POINTS_PER_RESOLVED : 0),
+      WELCOME_POINTS,
+    );
+}
+
+/**
+ * Toggles the current user's upvote on an issue inside a transaction so the
+ * count can never drift. `upvotesCount` is derived from `upvotedBy.length`
+ * (one source of truth). Self-upvotes are rejected. Returns the new upvote
+ * state, or throws on a real failure so the UI can roll back.
+ *
+ * NOTE: role gating (only citizens may upvote) is enforced by the caller and by
+ * Firestore rules; this helper only guards self-upvotes and atomicity.
+ */
+export async function toggleUpvote(
+  issueId: string,
+  uid: string,
+): Promise<{ upvoted: boolean; upvotesCount: number }> {
+  const issueRef = doc(db, "issues", issueId);
+  return runTransaction(db, async (tx) => {
+    const snap = await tx.get(issueRef);
+    if (!snap.exists()) throw new Error("Issue no longer exists.");
+    const data = snap.data() as CivicIssue;
+    if (data.reportedByUid === uid) {
+      throw new Error("You cannot upvote your own report.");
+    }
+    const current = data.upvotedBy || [];
+    const has = current.includes(uid);
+    const next = has ? current.filter((id) => id !== uid) : [...current, uid];
+    tx.update(issueRef, { upvotedBy: next, upvotesCount: next.length });
+    return { upvoted: !has, upvotesCount: next.length };
+  });
+}
+
+/**
+ * Marks an issue resolved exactly once. Guarded by a transaction so rapid or
+ * concurrent clicks cannot re-trigger it. No points are written here — points
+ * are computed live from the issue's "Resolved" status (see computeImpactPoints).
+ * Returns true if this call performed the resolution, false if it was already
+ * resolved.
+ */
+export async function resolveIssue(
+  issueId: string,
+  resolverUid: string,
+  resolution: {
+    resolvedImageUrl: string;
+    resolutionConfidence: number;
+    resolutionNotes: string;
+  },
+): Promise<boolean> {
+  const issueRef = doc(db, "issues", issueId);
+  return runTransaction(db, async (tx) => {
+    const snap = await tx.get(issueRef);
+    if (!snap.exists()) throw new Error("Issue no longer exists.");
+    const data = snap.data() as CivicIssue;
+    if (data.status === "Resolved") return false; // idempotent: already done
+    tx.update(issueRef, {
+      status: "Resolved",
+      resolvedImageUrl: resolution.resolvedImageUrl,
+      resolutionConfidence: resolution.resolutionConfidence,
+      resolutionNotes: resolution.resolutionNotes,
+      resolvedAt: Date.now(),
+      resolvedByUid: resolverUid,
+    });
+    return true;
+  });
+}
+
+/**
+ * LAYER 3 / RULE B — Official Staff Override ("Corroborate & Approve").
+ *
+ * When authenticated municipal staff approve a report, it bypasses the community
+ * consensus threshold and is immediately promoted to "Staff Verified" (the
+ * highest trust tier — turns the map pin green / high-priority). Idempotent and
+ * transactional so rapid double-clicks can't re-stamp the audit fields; returns
+ * true if THIS call performed the approval, false if it was already staff-verified.
+ *
+ * Authorization is enforced by Firestore rules: only staff whose scope
+ * `canActOn()` the issue may write these fields. Resolved reports are left as-is.
+ */
+export async function corroborateAndApprove(
+  issueId: string,
+  staffUid: string,
+  notes?: string,
+): Promise<boolean> {
+  const issueRef = doc(db, "issues", issueId);
+  return runTransaction(db, async (tx) => {
+    const snap = await tx.get(issueRef);
+    if (!snap.exists()) throw new Error("Issue no longer exists.");
+    const data = snap.data() as CivicIssue;
+    if (data.status === "Staff Verified") return false; // idempotent
+    if (data.status === "Resolved") {
+      throw new Error("This report is already resolved.");
+    }
+    tx.update(issueRef, {
+      status: "Staff Verified",
+      isCorroborated: true,
+      verifiedByUid: staffUid,
+      verifiedAt: Date.now(),
+      ...(notes ? { verificationNotes: notes } : {}),
+    });
+    return true;
+  });
+}
+
 /**
  * Calculates current civic rank status based on total accumulated impact points.
- * 
+ *
  * @param points - The citizen's current total impact points
  * @returns A descriptive civic level/rank string
  */
@@ -70,79 +211,46 @@ export function calculateCivicRank(points: number): string {
 }
 
 /**
- * Ensures a citizen profile document exists in Firestore.
- * If not, creates one centered around default tier levels.
- * 
+ * Ensures a citizen profile document exists in Firestore and returns it.
+ *
+ * IMPORTANT: this never writes `role`. Authoritative staff status lives in the
+ * server-enforced `config/roles` allowlist (see lib/roles.ts) — the profile's
+ * `role` field is display-only and must not be reconciled from the client (the
+ * security rules reject a client role change, which would otherwise brick the
+ * session for a previously-staff document).
+ *
  * @param user - Firebase authenticated user instance
- * @returns Promise containing the updated or existing CitizenProfile
+ * @returns Promise containing the existing or newly-created CitizenProfile
  */
-export async function syncCitizenProfile(user: User, role: 'citizen' | 'staff' = 'citizen'): Promise<CitizenProfile> {
+export async function syncCitizenProfile(
+  user: User,
+  _role: 'citizen' | 'staff' = 'citizen',
+): Promise<CitizenProfile> {
   const profileRef = doc(db, 'citizens', user.uid);
   try {
     const snap = await getDoc(profileRef);
     if (snap.exists()) {
-      const data = snap.data() as CitizenProfile;
-      if (data.role !== role) {
-        await updateDoc(profileRef, { role: role });
-        data.role = role;
-      }
-      return data;
-    } else {
-      const newProfile: CitizenProfile = {
-        uid: user.uid,
-        displayName: user.displayName || user.email?.split('@')[0] || 'Anonymous Hero',
-        photoURL: user.photoURL || `https://api.dicebear.com/7.x/bottts/svg?seed=${user.uid}`,
-        joinedAt: Date.now(),
-        impactPoints: 20, // Start with welcome incentive points
-        civicRank: 'Civic Novice',
-        reportsCount: 0,
-        role: role
-      };
-      await setDoc(profileRef, newProfile);
-      return newProfile;
+      return snap.data() as CitizenProfile;
     }
+    const newProfile: CitizenProfile = {
+      uid: user.uid,
+      displayName: user.displayName || user.email?.split('@')[0] || 'Anonymous Hero',
+      photoURL: user.photoURL || `https://api.dicebear.com/7.x/bottts/svg?seed=${user.uid}`,
+      joinedAt: Date.now(),
+      impactPoints: 20, // welcome incentive (display only; points are derived live)
+      civicRank: 'Civic Novice',
+      reportsCount: 0,
+      role: 'citizen', // never created as staff; staff come from config/roles
+    };
+    await setDoc(profileRef, newProfile);
+    return newProfile;
   } catch (err) {
     console.error('Error syncing citizen profile:', err);
     throw err;
   }
 }
 
-/**
- * Adds impact points to a user's citizen document in Firestore, adjusting rank level.
- * 
- * @param uid - The unique identifier of the target citizen user
- * @param pointsToAdd - Scalar points to aggregate
- */
-export async function rewardImpactPoints(uid: string, pointsToAdd: number): Promise<void> {
-  const profileRef = doc(db, 'citizens', uid);
-  try {
-    const snap = await getDoc(profileRef);
-    if (snap.exists()) {
-      const currentData = snap.data() as CitizenProfile;
-      const nextPoints = (currentData.impactPoints || 0) + pointsToAdd;
-      const nextRank = calculateCivicRank(nextPoints);
-      await updateDoc(profileRef, {
-        impactPoints: increment(pointsToAdd),
-        civicRank: nextRank
-      });
-    }
-  } catch (err) {
-    console.error('Error adding points to citizen:', err);
-  }
-}
-
-/**
- * Increments report counter on user profile document.
- * 
- * @param uid - The unique identifier of the target citizen user
- */
-export async function incrementReportsCount(uid: string): Promise<void> {
-  const profileRef = doc(db, 'citizens', uid);
-  try {
-    await updateDoc(profileRef, {
-      reportsCount: increment(1)
-    });
-  } catch (err) {
-    console.error('Error incrementing reports count:', err);
-  }
-}
+// NOTE: the previous denormalized-counter helpers (rewardImpactPoints /
+// incrementReportsCount) were removed. Points and report counts are derived
+// live from the issues collection (computeImpactPoints / computeReportsCount),
+// so they can never drift out of sync after a delete or purge.

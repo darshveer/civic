@@ -10,3 +10,8 @@ coverage/
 *.key
 *service-account*.json
 *.credentials.json
+<<<<<<< Updated upstream
+=======
+AI_STUDIO_PROMPTS.md
+.claude/
+>>>>>>> Stashed changes

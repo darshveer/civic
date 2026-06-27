@@ -1,11 +1,116 @@
 rules_version = '2';
+
+// ---------------------------------------------------------------------------
+// CIVIC security rules — authenticated access + municipal-hierarchy RBAC.
+//
+// Source of staff truth: config/roles  = { staff: { <uid>: { tier, wards[], zone } } }
+//   tier: "field" | "zonal" | "city"
+// config/wards = { wardToZone: { "<ward>": "<zone>" } }
+//
+// Seed config/roles (and config/wards) from the Firebase console for your first
+// city admin — console writes bypass these rules. After that, only a city admin
+// may edit the registry from the app.
+// ---------------------------------------------------------------------------
+
 service cloud.firestore {
   match /databases/{database}/documents {
-    match /citizens/{citizenId} {
-      allow read, write: if true;
+
+    function isSignedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+
+    // Safe registry access (handles a missing config/roles doc).
+    function rolesData() {
+      return exists(/databases/$(database)/documents/config/roles)
+        ? get(/databases/$(database)/documents/config/roles).data
+        : { 'staff': {} };
     }
+    function staffMap() { return rolesData().get('staff', {}); }
+    function isStaff(u) { return isSignedIn() && (u in staffMap()); }
+    function member(u) { return staffMap()[u]; }
+    function isCity(u)  { return isStaff(u) && member(u).tier == 'city'; }
+    function isZonal(u) { return isStaff(u) && member(u).tier == 'zonal'; }
+    function isField(u) { return isStaff(u) && member(u).tier == 'field'; }
+
+    // Does the signed-in staff member's scope cover this issue?
+    function canActOn(issue) {
+      return isCity(uid())
+        || (isZonal(uid()) && issue.get('zone', '') == member(uid()).get('zone', '__none__'))
+        || (isField(uid()) && (issue.get('ward', '__none__') in member(uid()).get('wards', [])));
+    }
+
+    // ----- config: registry + ward map ------------------------------------
+    match /config/{docId} {
+      allow read:  if isSignedIn();
+      allow write: if isCity(uid());
+    }
+
+    // ----- citizens: profiles ---------------------------------------------
+    match /citizens/{citizenId} {
+      allow read: if isSignedIn();
+      // Create your own profile; you cannot mark yourself staff.
+      allow create: if isSignedIn()
+        && citizenId == uid()
+        && request.resource.data.get('role', 'citizen') == 'citizen';
+      // Update only your own profile, and never your role/uid (no self-promotion).
+      allow update: if isSignedIn()
+        && citizenId == uid()
+        && request.resource.data.uid == resource.data.uid
+        && request.resource.data.get('role', 'citizen') == resource.data.get('role', 'citizen');
+      allow delete: if isCity(uid());
+    }
+
+    // ----- issues ----------------------------------------------------------
+    function affected() { return request.resource.data.diff(resource.data).affectedKeys(); }
+
+    // Upvote toggle: only the two upvote fields change, you're not the reporter,
+    // the count matches the array length, and you toggled exactly yourself.
+    function oldUp() { return resource.data.get('upvotedBy', []); }
+    function newUp() { return request.resource.data.get('upvotedBy', []); }
+    function addedSelf() {
+      return !oldUp().hasAny([uid()])
+        && newUp().toSet() == oldUp().toSet().union([uid()].toSet());
+    }
+    function removedSelf() {
+      return oldUp().hasAny([uid()])
+        && newUp().toSet() == oldUp().toSet().difference([uid()].toSet());
+    }
+    function isValidUpvote() {
+      return affected().hasOnly(['upvotedBy', 'upvotesCount'])
+        && resource.data.reportedByUid != uid()
+        && request.resource.data.upvotesCount == newUp().size()
+        && (addedSelf() || removedSelf());
+    }
+    // Comment add: only the comments field changes.
+    function isCommentEdit() { return affected().hasOnly(['comments']); }
+    // Petition draft/sign: only the petition field changes (any authed citizen).
+    function isPetitionEdit() { return affected().hasOnly(['petition']); }
+
+    // Community Verification (Trust Engine, Rule A): when a fresh report is
+    // corroborated by an independent nearby report, the matched (other user's)
+    // report is promoted to "Community Verified". Any signed-in user may perform
+    // this promotion, but ONLY the verification fields may change, ONLY into the
+    // "Community Verified" state, and never over a staff/resolved/flagged report
+    // (those outrank a community signal and must not be downgraded).
+    function isValidCommunityVerification() {
+      return affected().hasOnly(['status', 'isCorroborated', 'corroboratedGroupId'])
+        && request.resource.data.status == 'Community Verified'
+        && !(resource.data.get('status', 'Reported') in ['Staff Verified', 'Resolved', 'Flagged for Review']);
+    }
+
     match /issues/{issueId} {
-      allow read, write: if true;
+      // Public read: the civic map is public, and the server reads issues
+      // unauthenticated for AI triage/chat. Writes stay locked down below.
+      allow read: if true;
+      allow create: if isSignedIn()
+        && request.resource.data.reportedByUid == uid();
+      allow update: if isSignedIn() && (
+           isValidUpvote()
+        || isCommentEdit()
+        || isPetitionEdit()
+        || isValidCommunityVerification()  // Trust Engine Rule A (cross-user)
+        || canActOn(resource.data)   // staff status/assignment/resolution in scope
+      );
+      allow delete: if canActOn(resource.data);
     }
   }
 }
