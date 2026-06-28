@@ -1,6 +1,6 @@
 # C.I.V.I.C - Community Infrastructure Verification & Intelligent Clustering
 
-A modern, gamified civic engagement platform that connects citizens directly with city administration — built around a **fleet of 17 Gemini agents** that triage, verify, deduplicate, prioritise, predict, dispatch, and advocate. Several are **tool-using** agents: a citizen can file a report by chatting, staff can query live city data in plain language, and a work-order can be drafted and dispatched in one click.
+A modern, gamified civic engagement platform that connects citizens directly with city administration — built around a **fleet of 12 Gemini agents** (backed by **3 deterministic decision engines**) that triage, verify, deduplicate, prioritise, predict, dispatch, and advocate. Two are **tool-using / function-calling** agents: a citizen can file a report just by chatting, and staff can query live city data in plain language; a work-order can also be drafted and dispatched in one click.
 
 ## Features
 
@@ -24,31 +24,38 @@ A modern, gamified civic engagement platform that connects citizens directly wit
 - **Municipal Hierarchy (RBAC)**: Three staff tiers modelled on Indian urban local bodies — **Ward Officer (field)** → **Zonal Supervisor** → **City Administrator** — each scoped to the area they govern. Staff views, the cascading **State → City → Zone → Ward** filter, and all status/delete/purge actions are bounded by the signed-in officer's scope and enforced server-side by Firestore rules.
 - **Before / After Resolution**: Staff upload an "after" photo; the **Resolution-Verification agent** confirms the fix before the status flips to Resolved (once, via a transaction — no double-awards), and citizens see a before/after comparison.
 - **Email OTP Verification**: Email/password sign-ups verify via a one-time code over SMTP (in-memory, short TTL — no firebase-admin required).
-- **Resilient Model Cascade**: Every agent falls through **primary Gemini → lightweight Gemini (flash-lite) → Groq (text agents)**, then a static fallback, so an AI outage never breaks a citizen submission.
+- **Resilient Model Cascade**: Every agent falls through a **5-tier cascade — primary Gemini → lightweight Gemini → z.ai → OpenRouter → Groq** (text agents) — then a static fallback, with a **15-minute circuit breaker** that skips Gemini after a quota (429) error. Vision agents always use Gemini; everything **fails open**, so an AI outage never breaks a citizen submission.
 
 ## AI Agent Fleet
 
-| # | Agent | Trigger | What it does |
+CIVIC ships **12 Gemini-powered agents** wired into live features, plus **3 deterministic decision engines** in the report pipeline. Two agents are genuinely **tool-using** (multi-step / function-calling).
+
+| # | Gemini agent | Trigger | What it does |
 |---|-------|---------|--------------|
 | 1 | **Triage** | New report (image) | Category, severity (1–10) + one-line urgency rationale, confidence, department, description |
-| 2 | **Routing** | After triage | Auto-route (≥85% confidence) vs. Requires Human Verification |
-| 3 | **Verification / Dedup** | New report | 50m same-category radius match → corroborated group |
-| 4 | **Priority** | New report | P1–P4 tier + SLA target hours from severity/upvotes/corroboration |
-| 5 | **Cognitive Forensics** | New report (image) | Authenticity / fraud-confidence score + visual-evidence tags |
-| 6 | **Spatial Consensus** | New report | Independent nearby corroboration → Community Verified |
-| 7 | **Resolution-Verification** | Staff "after" photo | Before/after comparison confirms the fix before Resolved |
-| 8 | **Civic Assistant** | Chat | Grounded, multilingual Q&A over the user's + nearby reports |
-| 9 | **Smart Description** | Reporter | Image + voice note → polished multilingual description |
-| 10 | **Predictive Insight** | Staff dashboard | Geo-clusters reports into hotspots, then forecasts systemic problems with confidence |
-| 11 | **Daily Briefing** | Staff dashboard | Natural-language executive summary of the day |
-| 12 | **Impact Story** | Citizen dashboard | Shareable gamified contribution card |
-| 13 | **Civic Advocacy / Petition** | High-support issue | Drafts a formal petition to the right department |
-| 14 | **Missions Coach** | Citizen dashboard | Personalised motivating nudge toward the next rank |
-| 15 | **Conversational Reporting** 🛠️ | Civic Assistant chat | Tool-using: gathers details and files a report on the citizen's behalf |
-| 16 | **Staff Operations Analyst** 🛠️ | Staff dashboard | Function-calling loop over live, scoped data answers NL questions |
-| 17 | **Auto-Dispatch** 🛠️ | Staff issue detail | Drafts a department work-order email for one-click staff approval & send |
+| 2 | **Cognitive Forensics** | New report (image) | Authenticity / fraud-confidence score + visual-evidence tags |
+| 3 | **Civic Assistant** 🛠️ | Chat | Tool-using, multilingual: answers grounded questions over the user's + nearby reports **and** files a report on the citizen's behalf (function-calling, one-tap confirm) |
+| 4 | **Smart Description** | Reporter | Image + voice note → polished multilingual description |
+| 5 | **Resolution-Verification** | Staff "after" photo | Before/after comparison confirms the fix before Resolved |
+| 6 | **Staff Operations Analyst** 🛠️ | Staff dashboard | Multi-step function-calling loop over live, scoped data answers NL questions and shows the tool calls it made |
+| 7 | **Predictive Insight** | Staff dashboard | Grounds forecasts on real geospatial hotspot clusters with confidence + recommended action |
+| 8 | **Daily Briefing** | Staff dashboard | Natural-language executive summary of the day |
+| 9 | **Impact Story** | Citizen dashboard | Shareable gamified contribution card |
+| 10 | **Civic Advocacy / Petition** | High-support issue | Drafts a formal petition to the right department |
+| 11 | **Auto-Dispatch** | Staff issue detail | Drafts a department work-order email for one-click staff approval & send |
+| 12 | **Missions Coach** | Citizen dashboard | Personalised motivating nudge toward the next rank |
 
 🛠️ = tool-using / function-calling agent (multi-step, takes or proposes an action).
+
+**Deterministic decision engines** (rule-based, no LLM — fast and predictable):
+
+| Engine | Trigger | Output |
+|--------|---------|--------|
+| **Routing** | After triage | Auto-route (≥85% confidence) vs. Requires Human Verification |
+| **Consensus / Verification (dedup)** | New report | Haversine 50 m radius + shared visual-evidence tags from an *independent* reporter → corroborated group / Community Verified |
+| **Priority** | New report | P1–P4 tier + SLA target hours from severity, upvotes & corroboration |
+
+> Two further agents are implemented but not on the primary UI path: a grounded **Q&A Chatbot** (`/api/chat`) and an **LLM Zone-Mapping** agent (`/api/admin/map-zones`, where the live admin flow uses deterministic point-in-polygon tagging instead).
 
 ## Tech Stack
 
@@ -57,7 +64,7 @@ A modern, gamified civic engagement platform that connects citizens directly wit
 - **Backend**: Express server (Vite middleware in dev, static in prod) — uses the Firebase **client** SDK server-side, **no firebase-admin**, so it deploys cleanly on Google AI Studio / Cloud Run.
 - **Database**: Firebase Firestore (Real-time NoSQL), secured entirely by `firestore.rules`.
 - **Authentication**: Firebase Auth (Google Sign-In) + email/password with SMTP OTP verification.
-- **AI/ML**: Gemini multimodal (text, image, audio) with a resilient **Gemini → Gemini Lite → Groq** model cascade.
+- **AI/ML**: Gemini multimodal (text, image, audio) with function-calling, behind a resilient **5-tier model cascade** (primary Gemini → lightweight Gemini → z.ai → OpenRouter → Groq) and a 15-minute circuit breaker.
 - **Hosting**: Deployable via Google AI Studio / Firebase Hosting + a Node server for the `/api` routes.
 
 ## Future Extensions
