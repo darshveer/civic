@@ -39,7 +39,7 @@ import firebaseConfigJson from '../../firebase-applet-config.json';
 
 const env = typeof import.meta !== 'undefined' && (import.meta as any).env ? (import.meta as any).env : (process as unknown as { env?: Record<string, string | undefined> }).env || {};
 
-const firebaseConfig = {
+export const firebaseConfig = {
   apiKey: env.VITE_FIREBASE_API_KEY || env.FIREBASE_API_KEY || firebaseConfigJson.apiKey,
   authDomain:
     env.VITE_FIREBASE_AUTH_DOMAIN || env.FIREBASE_AUTH_DOMAIN ||

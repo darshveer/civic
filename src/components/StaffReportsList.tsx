@@ -5,7 +5,12 @@
 
 import React, { useState } from "react";
 import { db, corroborateAndApprove } from "../lib/firebase";
-import { canActOnIssue } from "../lib/roles";
+import {
+  canActOnIssue,
+  STAFF_ASSIGNABLE_STATUSES,
+  statusOptions,
+  statusLabel,
+} from "../lib/roles";
 import {
   collection,
   doc,
@@ -446,16 +451,14 @@ export default function StaffReportsList({
                     className="w-full text-xs px-3 min-h-[44px] bg-white dark:bg-gray-900 border border-[#E5E5E5] dark:border-gray-700 rounded-xl focus:outline-none focus:ring-2 focus:ring-primary text-[#1A1A1A] dark:text-white font-medium cursor-pointer"
                   >
                     <option value="All">All Statuses</option>
-                    <option value="Reported">Reported</option>
-                    <option value="Auto-Routed">Auto-Routed</option>
-                    <option value="Requires Human Verification">Verify Report</option>
-                    <option value="Pending Verification">Pending Verification</option>
-                    <option value="Corroborated Report">Corroborated</option>
+                    {STAFF_ASSIGNABLE_STATUSES.map((s) => (
+                      <option key={s} value={s}>
+                        {statusLabel(s)}
+                      </option>
+                    ))}
+                    {/* Read-only: community-earned, never staff-assignable, but
+                        staff can filter to find these and promote them. */}
                     <option value="Community Verified">Community Verified</option>
-                    <option value="Staff Verified">Staff Verified</option>
-                    <option value="Flagged for Review">Flagged for Review</option>
-                    <option value="In Progress">In Progress</option>
-                    <option value="Resolved">Resolved</option>
                   </select>
                 </div>
 
@@ -602,14 +605,11 @@ export default function StaffReportsList({
               className="text-xs bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg px-3 py-1.5 focus:outline-none text-gray-700 dark:text-gray-300 font-bold"
             >
               <option value="">Bulk Update Status...</option>
-              <option value="Reported">Reported</option>
-              <option value="Auto-Routed">Auto-Routed</option>
-              <option value="Pending Verification">Pending Verification</option>
-              <option value="Community Verified">Community Verified</option>
-              <option value="Staff Verified">Staff Verified</option>
-              <option value="Flagged for Review">Flagged for Review</option>
-              <option value="In Progress">In Progress</option>
-              <option value="Resolved">Resolved</option>
+              {STAFF_ASSIGNABLE_STATUSES.map((s) => (
+                <option key={s} value={s}>
+                  {statusLabel(s)}
+                </option>
+              ))}
             </select>
           )}
         </div>
@@ -736,16 +736,11 @@ export default function StaffReportsList({
                         }
                         className={`flex-1 min-w-0 text-[10px] font-bold uppercase tracking-wide px-2 py-1.5 rounded-lg border outline-none cursor-pointer ${getStatusBadgeStyle(issue.status)}`}
                       >
-                        <option value="Reported">Reported</option>
-                        <option value="Auto-Routed">Auto-Routed</option>
-                        <option value="Requires Human Verification">Verify Report</option>
-                        <option value="Pending Verification">Pending Verification</option>
-                        <option value="Corroborated Report">Corroborated</option>
-                        <option value="Community Verified">Community Verified</option>
-                        <option value="Staff Verified">Staff Verified</option>
-                        <option value="Flagged for Review">Flagged for Review</option>
-                        <option value="In Progress">In Progress</option>
-                        <option value="Resolved">Resolved</option>
+                        {statusOptions(issue.status).map((s) => (
+                          <option key={s} value={s}>
+                            {statusLabel(s)}
+                          </option>
+                        ))}
                       </select>
                       {onSelectIssue && onSetTab && (
                         <button
@@ -957,26 +952,11 @@ export default function StaffReportsList({
                         }
                         className={`text-[10px] font-bold uppercase tracking-widest px-3 py-1.5 rounded-full border outline-none min-h-[44px] cursor-pointer appearance-none text-center ${getStatusBadgeStyle(issue.status)}`}
                       >
-                        <option value="Reported">Reported</option>
-                        <option value="Auto-Routed">Auto-Routed</option>
-                        <option value="Requires Human Verification">
-                          Verify Report
-                        </option>
-                        <option value="Pending Verification">
-                          Pending Verification
-                        </option>
-                        <option value="Corroborated Report">
-                          Corroborated
-                        </option>
-                        <option value="Community Verified">
-                          Community Verified
-                        </option>
-                        <option value="Staff Verified">Staff Verified</option>
-                        <option value="Flagged for Review">
-                          Flagged for Review
-                        </option>
-                        <option value="In Progress">In Progress</option>
-                        <option value="Resolved">Resolved</option>
+                        {statusOptions(issue.status).map((s) => (
+                          <option key={s} value={s}>
+                            {statusLabel(s)}
+                          </option>
+                        ))}
                       </select>
                     </td>
 

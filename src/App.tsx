@@ -55,7 +55,15 @@ const StaffReportsList = lazy(() => import("./components/StaffReportsList"));
 const StaffDashboard = lazy(() => import("./components/StaffDashboard"));
 const SmartAssignmentBoard = lazy(() => import("./components/SmartAssignmentBoard"));
 const CivicAssistant = lazy(() => import("./components/CivicAssistant"));
+const AdminPanel = lazy(() => import("./components/AdminPanel"));
 import CursorFx from "./components/CursorFx";
+import {
+  TwoFactorChallenge,
+  TwoFactorSettings,
+  ForcePasswordChange,
+  loadStaff2FA,
+  mustChangePassword,
+} from "./components/StaffSecurity";
 
 import {
   LogOut,
@@ -80,9 +88,10 @@ import {
   Bell,
   Activity,
   LayoutDashboard,
+  ShieldCheck,
 } from "lucide-react";
 
-type TabType = "reporter" | "map" | "impact" | "staff-list" | "staff-analytics" | "staff-kanban";
+type TabType = "reporter" | "map" | "impact" | "staff-list" | "staff-analytics" | "staff-kanban" | "admin";
 
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
@@ -96,25 +105,30 @@ export default function App() {
   // allowlist (config/roles) — NOT from the client login toggle.
   const [scope, setScope] = useState<UserScope>({ role: "citizen", wards: [] });
   const isStaff = scope.role === "staff";
+  // Whether the signed-in email is an env-configured administrator (gates the
+  // Admin Panel — the actual unlock still needs the access code + 2FA).
+  const [isAdminAccount, setIsAdminAccount] = useState<boolean>(false);
   // Keep the latest chosen login intent readable inside stable callbacks.
   const loginRoleTabRef = useRef(loginRoleTab);
   useEffect(() => {
     loginRoleTabRef.current = loginRoleTab;
   }, [loginRoleTab]);
 
+  // True only when the user just clicked a sign-in button THIS page-load. A
+  // persisted Firebase session restored on page load (e.g. after a server
+  // restart) is NOT fresh — we use this to never auto-resume an admin into the
+  // app from a cached session; admins always re-authenticate from the login page.
+  const freshLoginRef = useRef(false);
+
   /**
-   * Resolves the user's authoritative scope from the allowlist. Bootstrap
-   * convenience: if NO staff are configured yet and the user explicitly chose
-   * the Staff tab, grant city-admin demo access so the app is usable out of the
-   * box. Once config/roles is seeded, real RBAC governs and this no longer fires.
+   * Resolves the user's authoritative scope STRICTLY from the server-enforced
+   * allowlist (config/roles). There is no client-side bootstrap/demo path —
+   * staff exist only because an administrator provisioned them (see AdminPanel),
+   * and Firestore rules enforce the same on every write.
    */
   const applyScope = async (uid: string): Promise<UserScope> => {
     const roles = await loadRolesConfig();
-    let s = resolveUserScope(uid, roles);
-    const noRegistry = Object.keys(roles.staff || {}).length === 0;
-    if (s.role === "citizen" && loginRoleTabRef.current === "staff" && noRegistry) {
-      s = { role: "staff", tier: "city", wards: [] };
-    }
+    const s = resolveUserScope(uid, roles);
     setScope(s);
     return s;
   };
@@ -124,8 +138,14 @@ export default function App() {
 
   const [isDropdownOpen, setIsDropdownOpen] = useState<boolean>(false);
   const [activeModal, setActiveModal] = useState<
-    "profile" | "my-reports" | "notifications" | null
+    "profile" | "my-reports" | "notifications" | "security" | null
   >(null);
+  // When a 2FA-enabled staff member signs in, the encrypted blob to challenge
+  // against. Non-null = the session is gated until they enter a valid code.
+  const [pending2FA, setPending2FA] = useState<string | null>(null);
+  // First-login: a freshly-provisioned staff member must replace their
+  // temporary password before using the app.
+  const [forcePwChange, setForcePwChange] = useState<boolean>(false);
   const [leaderboardCity, setLeaderboardCity] = useState<"Bangalore" | "Other">(
     "Bangalore",
   );
@@ -278,11 +298,66 @@ export default function App() {
       setAuthLoading(true);
       if (firebaseUser) {
         try {
+          // Did the user just sign in this page-load, or is this a restored
+          // (persisted/cached) session? Consume the flag immediately.
+          const isFreshLogin = freshLoginRef.current;
+          freshLoginRef.current = false;
+
+          // Is this email an administrator? (server-side env allowlist)
+          let admin = false;
+          try {
+            const r = await fetch("/api/admin/whoami", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ email: firebaseUser.email || "" }),
+            });
+            admin = (await r.json())?.isAdmin === true;
+          } catch {}
+
+          // Admins must use email & password — never Google sign-in.
+          const viaGoogle = firebaseUser.providerData.some(
+            (p) => p.providerId === "google.com",
+          );
+          if (admin && viaGoogle) {
+            setIsAdminAccount(false);
+            setUser(null);
+            setProfile(null);
+            setAuthError(
+              "Admin accounts must sign in with email & password, not Google.",
+            );
+            try { await signOut(auth); } catch (e) {}
+            setAuthLoading(false);
+            return;
+          }
+
+          // Never auto-resume an admin from a cached session — require a fresh
+          // sign-in from the login page each time the app (re)loads.
+          if (admin && !isFreshLogin) {
+            setIsAdminAccount(false);
+            setUser(null);
+            setProfile(null);
+            try { await signOut(auth); } catch (e) {}
+            setAuthLoading(false);
+            return;
+          }
+
+          setIsAdminAccount(admin);
           const userProfile = await syncCitizenProfile(firebaseUser);
           const s = await applyScope(firebaseUser.uid);
           setUser(firebaseUser);
           setProfile({ ...userProfile, role: s.role });
-          if (s.role === "staff") setActiveTab("map");
+          // Auto-jump to the Admin tab only on a FRESH login (not on restore).
+          if (admin && isFreshLogin) setActiveTab("admin");
+          else if (s.role === "staff") setActiveTab("map");
+
+          // First-login password change, then optional 2FA challenge.
+          if (s.role === "staff") {
+            if (await mustChangePassword(firebaseUser.uid)) {
+              setForcePwChange(true);
+            }
+            const tfa = await loadStaff2FA(firebaseUser.uid);
+            if (tfa.enabled && tfa.enc) setPending2FA(tfa.enc);
+          }
         } catch (err: any) {
           console.error("Profile sync failed:", err);
           setAuthError("Profile sync failed: " + (err?.message || err));
@@ -293,6 +368,7 @@ export default function App() {
       } else {
         setUser(null);
         setProfile(null);
+        setIsAdminAccount(false);
       }
       setAuthLoading(false);
     });
@@ -348,8 +424,10 @@ export default function App() {
     setAuthLoading(true);
     try {
       // onAuthStateChanged resolves profile + authoritative scope + landing tab.
+      freshLoginRef.current = true;
       await signInWithEmailAndPassword(auth, email, password);
     } catch (err: any) {
+      freshLoginRef.current = false; // failed attempt — don't leave it set
       if (err.code === "auth/invalid-credential" || err.code === "auth/user-not-found" || err.code === "auth/wrong-password") {
         setAuthError("Username or password is incorrect.");
       } else if (err.code === "auth/operation-not-allowed") {
@@ -414,6 +492,7 @@ export default function App() {
       if (!res.ok || !data.verified)
         throw new Error(data.error || "Verification failed.");
       // Email confirmed — now create the account.
+      freshLoginRef.current = true;
       const cred = await createUserWithEmailAndPassword(auth, email, password);
       const finalName = name || email.split("@")[0];
       const finalPhoto = `https://api.dicebear.com/7.x/bottts/svg?seed=${cred.user.uid}`;
@@ -471,6 +550,7 @@ export default function App() {
     setAuthLoading(true);
     const provider = new GoogleAuthProvider();
     try {
+      freshLoginRef.current = true;
       await signInWithPopup(auth, provider);
       // onAuthStateChanged finalises profile + scope.
     } catch (err) {
@@ -483,15 +563,28 @@ export default function App() {
         code === "auth/cancelled-popup-request"
       ) {
         setAuthError("Sign-in was cancelled.");
+      } else if (code === "auth/operation-not-allowed") {
+        // Most common after migrating to a new Firebase project.
+        setAuthError(
+          "Google sign-in isn't enabled for this Firebase project. Enable it in Firebase Console → Authentication → Sign-in method → Google.",
+        );
+      } else if (code === "auth/unauthorized-domain") {
+        setAuthError(
+          "This domain isn't authorized for Google sign-in. Add it in Firebase Console → Authentication → Settings → Authorized domains (localhost is there by default — make sure you're on http://localhost, not a raw IP).",
+        );
       } else {
         // Popups are frequently blocked (ad-blockers, embedded previews, COOP).
         // Fall back to a full-page redirect, which is far more reliable.
         try {
           await signInWithRedirect(auth, provider);
           return; // page navigates away to Google
-        } catch {
+        } catch (err2) {
+          const code2 =
+            err2 && typeof err2 === "object" && "code" in err2
+              ? String((err2 as { code: string }).code)
+              : "";
           setAuthError(
-            "Couldn't open Google sign-in. Please allow popups/redirects for this site, or sign in with email.",
+            `Couldn't open Google sign-in${code || code2 ? ` (${code || code2})` : ""}. Allow popups/redirects for this site, or sign in with email & password.`,
           );
         }
       }
@@ -503,6 +596,9 @@ export default function App() {
   const handleSignOut = async () => {
     setUser(null);
     setProfile(null);
+    setIsAdminAccount(false);
+    setPending2FA(null);
+    setForcePwChange(false);
     setActiveTab("reporter");
     setLoginRoleTab("citizen");
     setIsDropdownOpen(false);
@@ -516,6 +612,7 @@ export default function App() {
     setAuthError(null);
     setAuthLoading(true);
     try {
+      freshLoginRef.current = true;
       const cred = await signInAnonymously(auth);
       const finalName = `Hero_${Math.floor(1000 + Math.random() * 9000)}`;
       const finalPhoto = `https://api.dicebear.com/7.x/bottts/svg?seed=${cred.user.uid}`;
@@ -738,6 +835,23 @@ export default function App() {
   return (
     <div className="min-h-screen w-full overflow-x-hidden bg-gray-50 dark:bg-gray-950 flex flex-col justify-between font-sans text-[#1A1A1A] dark:text-white transition-colors duration-300">
       <CursorFx />
+
+      {/* First-login password change takes priority over the 2FA challenge. */}
+      {user && forcePwChange ? (
+        <ForcePasswordChange
+          currentUser={user}
+          onDone={() => setForcePwChange(false)}
+          onCancel={handleSignOut}
+        />
+      ) : (
+        user && pending2FA && (
+          <TwoFactorChallenge
+            enc={pending2FA}
+            onPass={() => setPending2FA(null)}
+            onCancel={handleSignOut}
+          />
+        )
+      )}
       <header className="h-16 bg-white/80 dark:bg-gray-900/80 backdrop-blur-md border-b border-[#E5E5E5] dark:border-gray-800 flex items-center justify-between px-4 sm:px-6 z-50 w-full sticky top-0">
         <div className="flex items-center gap-3">
           <img src="/civic-wordmark.svg" alt="CIVIC" className="h-6 sm:h-7 dark:invert" />
@@ -865,14 +979,26 @@ export default function App() {
                       </button>
                     </>
                   ) : (
-                    <div className="px-4 py-2 text-[9px] font-bold text-blue-600 bg-blue-50/50 dark:bg-blue-900/20 uppercase tracking-widest my-1 text-center rounded-lg mx-2">
-                      {tierLabel(scope.tier)}
-                      {scope.tier === "field" && scope.wards.length > 0 && (
-                        <span className="block text-[8px] mt-0.5 normal-case tracking-normal text-blue-500">
-                          {scope.wards.join(", ")}
-                        </span>
-                      )}
-                    </div>
+                    <>
+                      <div className="px-4 py-2 text-[9px] font-bold text-blue-600 bg-blue-50/50 dark:bg-blue-900/20 uppercase tracking-widest my-1 text-center rounded-lg mx-2">
+                        {tierLabel(scope.tier)}
+                        {scope.tier === "field" && scope.wards.length > 0 && (
+                          <span className="block text-[8px] mt-0.5 normal-case tracking-normal text-blue-500">
+                            {scope.wards.join(", ")}
+                          </span>
+                        )}
+                      </div>
+                      <button
+                        onClick={() => {
+                          setIsDropdownOpen(false);
+                          setActiveModal("security");
+                        }}
+                        className="w-full text-left px-4 py-2.5 text-xs font-semibold text-[#1A1A1A] dark:text-white hover:bg-[#F5F5F5] dark:hover:bg-gray-800 transition-colors flex items-center gap-2.5 cursor-pointer"
+                      >
+                        <ShieldCheck className="w-4 h-4 text-[#717171] dark:text-gray-400" />
+                        Security &amp; 2FA
+                      </button>
+                    </>
                   )}
 
                   <div className="border-t border-[#F0F0F0] mt-1 pt-1">
@@ -958,9 +1084,18 @@ export default function App() {
                   }}
                   className={`flex-1 py-2.5 rounded-xl text-xs font-bold transition-all duration-300 ${loginRoleTab === "staff" ? "bg-white dark:bg-gray-700 shadow-md text-gray-900 dark:text-white" : "text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white hover:bg-gray-200/50 dark:hover:bg-gray-700/50"}`}
                 >
-                  Staff
+                  Staff / Admin
                 </button>
               </div>
+
+              {loginRoleTab === "staff" && (
+                <p className="-mt-4 mb-4 text-[11px] text-gray-500 dark:text-gray-400 leading-relaxed">
+                  Municipal staff & administrators sign in with the{" "}
+                  <strong>email &amp; password</strong> issued to them. Accounts
+                  are created by an administrator — there is no staff self-signup
+                  or Google sign-in.
+                </p>
+              )}
 
               {authError && (
                 <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: "auto" }} className="bg-red-50 dark:bg-red-900/30 border border-red-200 dark:border-red-800/50 text-xs text-red-600 dark:text-red-400 p-3.5 rounded-xl flex gap-2 items-start">
@@ -970,26 +1105,31 @@ export default function App() {
               )}
 
               <div className="space-y-4">
-                <button
-                  onClick={handleGoogleSignIn}
-                  disabled={authLoading}
-                  className="w-full bg-white dark:bg-gray-800 hover:bg-gray-50 dark:hover:bg-gray-700 text-gray-900 dark:text-white border border-gray-200 dark:border-gray-700 text-sm font-bold py-3.5 px-4 rounded-2xl transition-all duration-300 flex items-center justify-center gap-3 cursor-pointer shadow-sm hover:shadow-md"
-                >
-                  <img
-                    src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg"
-                    alt="Google logo"
-                    className="w-5 h-5"
-                  />
-                  <span>Continue with Google</span>
-                </button>
-                
-                <div className="relative flex py-4 items-center">
-                  <div className="flex-grow border-t border-gray-200 dark:border-gray-700"></div>
-                  <span className="flex-shrink mx-4 text-[10px] uppercase font-bold tracking-widest text-gray-400 dark:text-gray-500">
-                    OR
-                  </span>
-                  <div className="flex-grow border-t border-gray-200 dark:border-gray-700"></div>
-                </div>
+                {/* Google sign-in is for CITIZENS only — staff/admin use email+password. */}
+                {loginRoleTab === "citizen" && (
+                  <>
+                    <button
+                      onClick={handleGoogleSignIn}
+                      disabled={authLoading}
+                      className="w-full bg-white dark:bg-gray-800 hover:bg-gray-50 dark:hover:bg-gray-700 text-gray-900 dark:text-white border border-gray-200 dark:border-gray-700 text-sm font-bold py-3.5 px-4 rounded-2xl transition-all duration-300 flex items-center justify-center gap-3 cursor-pointer shadow-sm hover:shadow-md"
+                    >
+                      <img
+                        src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg"
+                        alt="Google logo"
+                        className="w-5 h-5"
+                      />
+                      <span>Continue with Google</span>
+                    </button>
+
+                    <div className="relative flex py-4 items-center">
+                      <div className="flex-grow border-t border-gray-200 dark:border-gray-700"></div>
+                      <span className="flex-shrink mx-4 text-[10px] uppercase font-bold tracking-widest text-gray-400 dark:text-gray-500">
+                        OR
+                      </span>
+                      <div className="flex-grow border-t border-gray-200 dark:border-gray-700"></div>
+                    </div>
+                  </>
+                )}
 
                 {isAuthMode === "register" && otpStep === "code" ? (
                   <div className="space-y-4 animate-in fade-in slide-in-from-right-3 duration-200">
@@ -1132,19 +1272,18 @@ export default function App() {
                   </div>
                 )}
                 
-                <div className="pt-4 border-t border-gray-200 dark:border-gray-700 text-center">
-                   <button
-                    onClick={handleInstantGuestSignIn}
-                    disabled={authLoading}
-                    className="text-xs text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white font-semibold transition-colors flex items-center justify-center gap-1.5 mx-auto"
-                  >
-                    <span>
-                      {loginRoleTab === "staff"
-                        ? "Explore as Staff (Guest)"
-                        : "Continue as Guest"}
-                    </span>
-                  </button>
-                </div>
+                {/* Guest access is CITIZEN-only — there is no staff/admin guest path. */}
+                {loginRoleTab === "citizen" && (
+                  <div className="pt-4 border-t border-gray-200 dark:border-gray-700 text-center">
+                    <button
+                      onClick={handleInstantGuestSignIn}
+                      disabled={authLoading}
+                      className="text-xs text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white font-semibold transition-colors flex items-center justify-center gap-1.5 mx-auto"
+                    >
+                      <span>Continue as Guest</span>
+                    </button>
+                  </div>
+                )}
               </div>
             </motion.div>
           </div>
@@ -1213,6 +1352,9 @@ export default function App() {
                         currentUser={user}
                         scope={scope}
                       />
+                    )}
+                    {activeTab === "admin" && isAdminAccount && (
+                      <AdminPanel currentUser={user} issues={issues} />
                     )}
                   </motion.div>
                 </AnimatePresence>
@@ -1378,6 +1520,29 @@ export default function App() {
                   className={`relative z-10 transition-colors hidden sm:inline-block ${activeTab === "impact" ? "text-white" : "text-gray-600 dark:text-gray-300 group-hover:text-gray-900 dark:group-hover:text-white"}`}
                 >
                   Impact
+                </span>
+              </button>
+            )}
+
+            {isAdminAccount && (
+              <button
+                onClick={() => setActiveTab("admin")}
+                className="relative px-4 sm:px-5 py-2.5 rounded-full text-xs font-bold transition-colors cursor-pointer group flex items-center gap-2"
+              >
+                {activeTab === "admin" && (
+                  <motion.div
+                    layoutId="nav-pill"
+                    className="absolute inset-0 bg-[#2F6F6A] rounded-full"
+                    transition={{ type: "spring", stiffness: 300, damping: 25 }}
+                  />
+                )}
+                <ShieldCheck
+                  className={`w-4 h-4 relative z-10 transition-colors ${activeTab === "admin" ? "text-white" : "text-gray-600 dark:text-gray-300 group-hover:text-gray-900 dark:group-hover:text-white"}`}
+                />
+                <span
+                  className={`relative z-10 transition-colors hidden sm:inline-block ${activeTab === "admin" ? "text-white" : "text-gray-600 dark:text-gray-300 group-hover:text-gray-900 dark:group-hover:text-white"}`}
+                >
+                  Admin
                 </span>
               </button>
             )}
@@ -1806,6 +1971,25 @@ export default function App() {
                 </table>
               </div>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* Staff security / 2FA */}
+      {activeModal === "security" && (
+        <div className="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center p-4 z-50 animate-in fade-in duration-200">
+          <div className="bg-white dark:bg-gray-900 rounded-3xl border border-[#E5E5E5] dark:border-gray-800 max-w-md w-full p-6 md:p-8 shadow-2xl relative max-h-[90vh] overflow-y-auto animate-in zoom-in-95 duration-200">
+            <button
+              onClick={() => setActiveModal(null)}
+              className="absolute top-4 right-4 p-2 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 rounded-full hover:bg-gray-100 dark:hover:bg-gray-800 transition-all cursor-pointer"
+              title="Close"
+            >
+              <X className="w-5 h-5" />
+            </button>
+            <h3 className="text-xl font-display font-bold tracking-tight text-gray-900 dark:text-white mb-5">
+              Account Security
+            </h3>
+            <TwoFactorSettings currentUser={user} isAdmin={isAdminAccount} />
           </div>
         </div>
       )}

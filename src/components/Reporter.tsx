@@ -16,6 +16,8 @@ import {
 import ExifReader from "exifreader";
 import { db } from "../lib/firebase";
 import { loadWardsConfig, zoneForWard } from "../lib/roles";
+import { resolveZoneAuthoritative, servedState, normalizeName } from "../lib/cityZones";
+import { wardZoneAtPoint } from "../lib/wardLookup";
 import {
   collection,
   addDoc,
@@ -24,7 +26,8 @@ import {
 } from "firebase/firestore";
 import type { User } from "firebase/auth";
 import { TriageResult, CivicIssue, MetadataMode } from "../types";
-import { useMapsLibrary, Map as GoogleMap } from "@vis.gl/react-google-maps";
+import { Map as GoogleMap, useMap } from "@vis.gl/react-google-maps";
+import { searchPlaces, reverseGeocode, GeoResult } from "../lib/geocode";
 
 interface ReporterProps {
   onSuccess: (newIssue: CivicIssue) => void;
@@ -32,28 +35,6 @@ interface ReporterProps {
   isDarkMode?: boolean;
 }
 
-interface ParsedGeo {
-  address: string;
-  ward: string;
-  city: string;
-  state: string;
-}
-
-/** Extracts a usable address + administrative geography from a geocode result. */
-function parseGeocode(result: google.maps.GeocoderResult): ParsedGeo {
-  const find = (types: string[]) =>
-    result.address_components.find((c) =>
-      types.some((t) => c.types.includes(t)),
-    );
-  const ward =
-    find(["sublocality", "neighborhood"])?.short_name ||
-    find(["locality"])?.short_name ||
-    "";
-  const city =
-    find(["locality", "administrative_area_level_2"])?.long_name || "";
-  const state = find(["administrative_area_level_1"])?.long_name || "";
-  return { address: result.formatted_address, ward, city, state };
-}
 
 /**
  * LAYER 1 — Parses embedded EXIF metadata from an image file binary.
@@ -112,6 +93,13 @@ function ReporterInner({ onSuccess, currentUser, isDarkMode }: ReporterProps) {
   >("idle");
   const [geolocError, setGeolocError] = useState<string | null>(null);
 
+  // Free, billing-free place search (Photon / OpenStreetMap) — replaces Google
+  // Places Autocomplete, which requires a Google billing account.
+  const [searchQuery, setSearchQuery] = useState<string>("");
+  const [searchResults, setSearchResults] = useState<GeoResult[]>([]);
+  const [searchOpen, setSearchOpen] = useState<boolean>(false);
+  const [searching, setSearching] = useState<boolean>(false);
+
   type PermState = "unknown" | "granted" | "denied" | "prompt";
   const [cameraPermission, setCameraPermission] = useState<PermState>("unknown");
   const [locationPermission, setLocationPermission] =
@@ -149,8 +137,9 @@ function ReporterInner({ onSuccess, currentUser, isDarkMode }: ReporterProps) {
     requestCameraAccess();
   };
 
-  const geocodingLib = useMapsLibrary("geocoding");
-  const placesLib = useMapsLibrary("places");
+  // Imperative handle to the confirm-location map (for programmatic recenters
+  // on GPS / search). The map itself stays UNCONTROLLED so panning is smooth.
+  const map = useMap("reporter-map");
 
   const [isTriaging, setIsTriaging] = useState<boolean>(false);
   const [triageError, setTriageError] = useState<string | null>(null);
@@ -214,36 +203,42 @@ function ReporterInner({ onSuccess, currentUser, isDarkMode }: ReporterProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Reverse-geocode the pin (free, via Photon) whenever it moves. Debounced so
+  // panning the map doesn't fire a request every frame.
   useEffect(() => {
-    if (geocodingLib && location && location.address === "Fetching address...") {
-      const timeoutId = setTimeout(() => {
-        const fetchAddress = async () => {
-          const geocoder = new geocodingLib.Geocoder();
-          geocoder.geocode(
-            { location: { lat: location.latitude, lng: location.longitude } },
-            (results, status) => {
-              if (status === "OK" && results && results[0]) {
-                const geo = parseGeocode(results[0]);
-                setLocation((prev) => (prev ? { ...prev, ...geo } : prev));
-              } else {
-                console.warn("Geocoder status:", status);
-                setLocation((prev) =>
-                  prev
-                    ? {
-                        ...prev,
-                        address: `${location.latitude.toFixed(5)}, ${location.longitude.toFixed(5)}`,
-                      }
-                    : prev,
-                );
-              }
-            }
-          );
-        };
-        fetchAddress();
-      }, 800); // 800ms debounce
-      return () => clearTimeout(timeoutId);
-    }
-  }, [geocodingLib, location?.latitude, location?.longitude, location?.address]);
+    if (!location || location.address !== "Fetching address...") return;
+    const lat = location.latitude;
+    const lng = location.longitude;
+    const ctrl = new AbortController();
+    const timeoutId = setTimeout(async () => {
+      try {
+        const geo = await reverseGeocode(lat, lng, ctrl.signal);
+        setLocation((prev) =>
+          prev
+            ? geo
+              ? {
+                  ...prev,
+                  address: geo.address,
+                  ward: geo.ward,
+                  city: geo.city,
+                  state: geo.state,
+                }
+              : { ...prev, address: `${lat.toFixed(5)}, ${lng.toFixed(5)}` }
+            : prev,
+        );
+      } catch (e) {
+        if ((e as any)?.name === "AbortError") return;
+        console.warn("Reverse geocode failed:", e);
+        setLocation((prev) =>
+          prev ? { ...prev, address: `${lat.toFixed(5)}, ${lng.toFixed(5)}` } : prev,
+        );
+      }
+    }, 700);
+    return () => {
+      clearTimeout(timeoutId);
+      ctrl.abort();
+    };
+  }, [location?.latitude, location?.longitude, location?.address]);
 
   const requestLocation = () => {
     if (!navigator.geolocation) {
@@ -255,16 +250,17 @@ function ReporterInner({ onSuccess, currentUser, isDarkMode }: ReporterProps) {
     setGeolocError(null);
     navigator.geolocation.getCurrentPosition(
       async (position) => {
-        setLocation({
-          latitude: position.coords.latitude,
-          longitude: position.coords.longitude,
-          address: "Fetching address...",
-        });
+        const lat = position.coords.latitude;
+        const lng = position.coords.longitude;
+        setLocation({ latitude: lat, longitude: lng, address: "Fetching address..." });
         setLocatingState("success");
+        setIsLocationConfirmed(false);
+        map?.panTo({ lat, lng });
       },
-      (error) => {
+      () => {
         setLocatingState("failed");
         setLocation({ latitude: 12.9716, longitude: 77.5946, address: "Fetching address..." });
+        map?.panTo({ lat: 12.9716, lng: 77.5946 });
         setGeolocError(
           "Location access denied. Defaulting to Bangalore city center.",
         );
@@ -371,65 +367,50 @@ function ReporterInner({ onSuccess, currentUser, isDarkMode }: ReporterProps) {
   
   const [isLocationConfirmed, setIsLocationConfirmed] = useState<boolean>(false);
   const [locationError, setLocationError] = useState<string | null>(null);
-  const autocompleteInputRef = useRef<HTMLInputElement>(null);
-  const [placeAutocomplete, setPlaceAutocomplete] = useState<google.maps.places.Autocomplete | null>(null);
 
-  const handleLocationChange = async (lat: number, lng: number) => {
+  // Debounced free-text place search (Photon). Replaces Google Places Autocomplete.
+  useEffect(() => {
+    const q = searchQuery.trim();
+    if (q.length < 3) {
+      setSearchResults([]);
+      return;
+    }
+    const ctrl = new AbortController();
+    const t = setTimeout(async () => {
+      setSearching(true);
+      try {
+        const results = await searchPlaces(q, ctrl.signal);
+        setSearchResults(results);
+        setSearchOpen(true);
+      } catch (e) {
+        if ((e as any)?.name !== "AbortError") setSearchResults([]);
+      } finally {
+        setSearching(false);
+      }
+    }, 350);
+    return () => {
+      clearTimeout(t);
+      ctrl.abort();
+    };
+  }, [searchQuery]);
+
+  // Apply a chosen search result: drop the pin, recentre the map, fill address.
+  const pickSearchResult = (r: GeoResult) => {
     setIsLocationConfirmed(false);
     setLocationError(null);
-    setLocation(prev => ({ latitude: lat, longitude: lng, address: "Fetching address...", ward: prev?.ward }));
-    
-    if (geocodingLib) {
-      try {
-        const geocoder = new geocodingLib.Geocoder();
-        const result = await geocoder.geocode({ location: { lat, lng } });
-        if (result.results[0]) {
-          const geo = parseGeocode(result.results[0]);
-          setLocation((prev) => (prev ? { ...prev, ...geo } : prev));
-        } else {
-          setLocation((prev) =>
-            prev ? { ...prev, address: `${lat.toFixed(5)}, ${lng.toFixed(5)} (Unknown Address)` } : prev,
-          );
-        }
-      } catch (e) {
-        console.error("Geocoding failed. Check if Geocoding API is enabled on your API key.", e);
-        setLocation((prev) =>
-          prev ? { ...prev, address: `${lat.toFixed(5)}, ${lng.toFixed(5)} (Unknown Address)` } : prev,
-        );
-      }
-    }
-  };
-
-  useEffect(() => {
-    if (!placesLib || !autocompleteInputRef.current) return;
-    // Prevent multiple initializations
-    if (placeAutocomplete) return;
-    
-    const options = { fields: ["geometry", "name", "formatted_address"], types: ["geocode"] };
-    const autocomplete = new placesLib.Autocomplete(autocompleteInputRef.current, options);
-    setPlaceAutocomplete(autocomplete);
-    
-    // Cleanup is tricky with Autocomplete, but we can clear the listener if needed.
-    // The main thing is avoiding creating a new Autocomplete object on every re-render.
-  }, [placesLib, autocompleteInputRef, placeAutocomplete]);
-
-  useEffect(() => {
-    if (!placeAutocomplete) return;
-    const listener = placeAutocomplete.addListener("place_changed", () => {
-      const place = placeAutocomplete.getPlace();
-      if (place.geometry?.location) {
-        handleLocationChange(place.geometry.location.lat(), place.geometry.location.lng());
-        if (autocompleteInputRef.current && place.formatted_address) {
-          autocompleteInputRef.current.value = place.formatted_address;
-        }
-      } else {
-        setLocationError("Please select a valid place from the dropdown or tap on the map.");
-      }
+    setLocation({
+      latitude: r.lat,
+      longitude: r.lng,
+      address: r.address,
+      ward: r.ward,
+      city: r.city,
+      state: r.state,
     });
-    return () => {
-      google.maps.event.removeListener(listener);
-    };
-  }, [placeAutocomplete, geocodingLib]);
+    map?.panTo({ lat: r.lat, lng: r.lng });
+    setSearchQuery(r.address);
+    setSearchResults([]);
+    setSearchOpen(false);
+  };
 
   const startRecording = async () => {
     try {
@@ -585,9 +566,17 @@ function ReporterInner({ onSuccess, currentUser, isDarkMode }: ReporterProps) {
       else if (communityVerified) trustStatus = "Community Verified";
       else trustStatus = "Pending Verification";
 
-      // Stamp the zone from the ward→zone map so staff hierarchy scoping works.
+      // Stamp the OFFICIAL ward + zone by point-in-polygon against the BBMP ward
+      // boundaries — so staff scoping matches the names the admin assigns. Falls
+      // back to the geocoded ward + authoritative/config zone outside BBMP.
       const wards = await loadWardsConfig();
-      const zone = zoneForWard(location.ward, wards) || "";
+      const official = await wardZoneAtPoint(location.latitude, location.longitude);
+      const officialWard = official?.ward || location.ward || "";
+      const zone =
+        official?.zone ||
+        resolveZoneAuthoritative(location.city, location.ward) ||
+        zoneForWard(location.ward, wards) ||
+        "";
       const issueData: Omit<CivicIssue, "id"> = {
         imageUrl: imagePreview || "",
         category: triageOutput.triage.category || "Other",
@@ -604,6 +593,7 @@ function ReporterInner({ onSuccess, currentUser, isDarkMode }: ReporterProps) {
         duplicateCount: 1,
         escalationLevel: 0,
         ...location,
+        ward: officialWard,
         zone,
         reportedByUid: currentUser.uid,
         reportedByName: currentUser.displayName || "Civic Hero",
@@ -1095,12 +1085,35 @@ function ReporterInner({ onSuccess, currentUser, isDarkMode }: ReporterProps) {
                 Confirm Location
               </div>
               <div className="flex flex-col gap-2 mb-3">
-                <input
-                  ref={autocompleteInputRef}
-                  type="text"
-                  placeholder="Search address or place"
-                  className="w-full text-xs text-gray-800 dark:text-gray-200 bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg p-2.5 outline-none focus:ring-2 focus:ring-primary/20"
-                />
+                <div className="relative">
+                  <input
+                    type="text"
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    onFocus={() => searchResults.length && setSearchOpen(true)}
+                    placeholder="Search address or place"
+                    className="w-full text-xs text-gray-800 dark:text-gray-200 bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg p-2.5 outline-none focus:ring-2 focus:ring-primary/20"
+                  />
+                  {searching && (
+                    <span className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[10px] text-gray-400">
+                      …
+                    </span>
+                  )}
+                  {searchOpen && searchResults.length > 0 && (
+                    <div className="absolute z-20 left-0 right-0 mt-1 bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg shadow-lg max-h-44 overflow-y-auto no-scrollbar">
+                      {searchResults.map((r, idx) => (
+                        <button
+                          key={idx}
+                          onClick={() => pickSearchResult(r)}
+                          className="w-full text-left px-3 py-2 text-[11px] text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-800 border-b border-gray-100 dark:border-gray-800 last:border-0 flex items-start gap-1.5"
+                        >
+                          <MapPin className="w-3 h-3 mt-0.5 shrink-0 text-primary" />
+                          <span className="truncate">{r.address}</span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
                 <button
                   onClick={requestLocation}
                   className="text-[10px] self-start flex items-center gap-1.5 px-3 py-1.5 rounded-full font-bold uppercase tracking-widest cursor-pointer border border-[#E5E5E5] dark:border-gray-700 bg-white dark:bg-gray-800 text-[#4A4A4A] dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors"
@@ -1110,18 +1123,36 @@ function ReporterInner({ onSuccess, currentUser, isDarkMode }: ReporterProps) {
               </div>
               <div className="relative h-48 rounded-xl overflow-hidden border border-gray-200 dark:border-gray-700 mb-3 shadow-sm">
                 <GoogleMap
-                  center={{ lat: location.latitude, lng: location.longitude }}
+                  id="reporter-map"
+                  defaultCenter={{ lat: location.latitude, lng: location.longitude }}
                   defaultZoom={17}
                   disableDefaultUI={true}
+                  gestureHandling="greedy"
                   mapId="DEMO_MAP_ID"
                   colorScheme={isDarkMode ? "DARK" : "LIGHT"}
-                  onCameraChanged={(e) => {
-                    const center = e.detail.center;
-                    if (center && (Math.abs(center.lat - location.latitude) > 0.0001 || Math.abs(center.lng - location.longitude) > 0.0001)) {
-                      // We don't call handleLocationChange immediately to avoid spamming geocoder.
-                      // Instead, we just update the coordinates silently. The geocoding effect will catch it.
-                      setLocation(prev => prev ? { ...prev, latitude: center.lat, longitude: center.lng, address: "Fetching address..." } : prev);
-                    }
+                  onIdle={(e) => {
+                    // Fires only when the map settles (not every frame), so panning
+                    // is smooth. The map is UNCONTROLLED (defaultCenter) — we read
+                    // the final centre here and the debounced effect reverse-geocodes.
+                    const c = e.map.getCenter();
+                    if (!c) return;
+                    const lat = c.lat();
+                    const lng = c.lng();
+                    setLocation((prev) => {
+                      if (!prev) return prev;
+                      if (
+                        Math.abs(prev.latitude - lat) < 0.00005 &&
+                        Math.abs(prev.longitude - lng) < 0.00005
+                      )
+                        return prev;
+                      return {
+                        ...prev,
+                        latitude: lat,
+                        longitude: lng,
+                        address: "Fetching address...",
+                      };
+                    });
+                    setIsLocationConfirmed(false);
                   }}
                 >
                 </GoogleMap>
@@ -1134,6 +1165,20 @@ function ReporterInner({ onSuccess, currentUser, isDarkMode }: ReporterProps) {
                 <p className="text-xs text-[#4A4A4A] dark:text-gray-300 bg-gray-100 dark:bg-gray-800 p-2.5 rounded-lg border border-gray-200 dark:border-gray-700 truncate">
                   {location.address || "Fetching address..."}
                 </p>
+                {(() => {
+                  const served = servedState(location.city);
+                  const mismatch =
+                    served &&
+                    location.state &&
+                    normalizeName(location.state) !== normalizeName(served);
+                  return mismatch ? (
+                    <p className="text-[11px] text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800/50 rounded-lg p-2 leading-snug">
+                      ⚠️ This pin is in <strong>{location.state}</strong>, but{" "}
+                      {location.city} is served under <strong>{served}</strong>.
+                      Please double-check the location before submitting.
+                    </p>
+                  ) : null;
+                })()}
                 <button
                   onClick={() => setIsLocationConfirmed(true)}
                   className={`w-full py-2.5 rounded-lg text-xs font-bold uppercase tracking-widest transition-colors ${
@@ -1196,7 +1241,7 @@ const hasValidKey = Boolean(API_KEY) && API_KEY !== "YOUR_API_KEY";
 
 export default function Reporter(props: ReporterProps) {
   return (
-    <APIProvider apiKey={API_KEY || ""} libraries={["places"]}>
+    <APIProvider apiKey={API_KEY || ""}>
       {!hasValidKey ? (
         <div className="flex flex-col items-center justify-center p-6 text-center bg-gray-50 dark:bg-gray-800 rounded-2xl h-full">
           <p className="text-red-600 dark:text-red-400 font-bold mb-2">Maps API Key Missing</p>

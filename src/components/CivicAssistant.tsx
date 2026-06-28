@@ -23,12 +23,14 @@ import {
   AdvancedMarker,
   Pin,
   useMap,
-  useMapsLibrary,
 } from "@vis.gl/react-google-maps";
 import { db } from "../lib/firebase";
 import { loadWardsConfig, zoneForWard } from "../lib/roles";
+import { resolveZoneAuthoritative } from "../lib/cityZones";
+import { wardZoneAtPoint } from "../lib/wardLookup";
 import { CivicCategory, CivicIssue, CivicStatus } from "../types";
 import { homeCoords, haversineMeters } from "../lib/civic";
+import { searchPlaces, reverseGeocode, GeoResult } from "../lib/geocode";
 
 const MAPS_KEY =
   (process.env as any).GOOGLE_MAPS_PLATFORM_KEY ||
@@ -63,68 +65,84 @@ function LocationPickerInner({
   lng: number;
   onPick: (p: PickedLocation) => void;
 }) {
-  const geocodingLib = useMapsLibrary("geocoding");
-  const placesLib = useMapsLibrary("places");
-  const inputRef = useRef<HTMLInputElement>(null);
-  const [ac, setAc] = useState<google.maps.places.Autocomplete | null>(null);
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState<GeoResult[]>([]);
+  const [open, setOpen] = useState(false);
 
-  const resolveAndPick = async (la: number, ln: number) => {
-    let address = "";
-    let ward = "";
-    let city = "";
-    let state = "";
-    if (geocodingLib) {
-      try {
-        const g = new geocodingLib.Geocoder();
-        const res = await g.geocode({ location: { lat: la, lng: ln } });
-        const r = res.results[0];
-        if (r) {
-          const find = (types: string[]) =>
-            r.address_components.find((c) =>
-              types.some((t) => c.types.includes(t)),
-            );
-          ward =
-            find(["sublocality", "neighborhood"])?.short_name ||
-            find(["locality"])?.short_name ||
-            "";
-          city =
-            find(["locality", "administrative_area_level_2"])?.long_name || "";
-          state = find(["administrative_area_level_1"])?.long_name || "";
-          address = r.formatted_address;
-        }
-      } catch {
-        /* keep coords even if reverse-geocode fails */
-      }
+  // Debounced free place search (Photon — keyless, no Google billing).
+  useEffect(() => {
+    const q = query.trim();
+    if (q.length < 3) {
+      setResults([]);
+      return;
     }
-    onPick({ lat: la, lng: ln, address, ward, city, state });
+    const ctrl = new AbortController();
+    const t = setTimeout(async () => {
+      try {
+        const r = await searchPlaces(q, ctrl.signal);
+        setResults(r);
+        setOpen(true);
+      } catch (e) {
+        if ((e as any)?.name !== "AbortError") setResults([]);
+      }
+    }, 350);
+    return () => {
+      clearTimeout(t);
+      ctrl.abort();
+    };
+  }, [query]);
+
+  // Drop the pin immediately, then enrich with a reverse-geocoded address.
+  const reverseAndPick = async (la: number, ln: number) => {
+    onPick({
+      lat: la,
+      lng: ln,
+      address: `${la.toFixed(5)}, ${ln.toFixed(5)}`,
+      ward: "",
+      city: "",
+      state: "",
+    });
+    try {
+      const geo = await reverseGeocode(la, ln);
+      if (geo) onPick(geo);
+    } catch {
+      /* keep coords if reverse lookup fails */
+    }
   };
 
-  useEffect(() => {
-    if (!placesLib || !inputRef.current) return;
-    const a = new placesLib.Autocomplete(inputRef.current, {
-      fields: ["geometry", "formatted_address"],
-    });
-    setAc(a);
-  }, [placesLib]);
-
-  useEffect(() => {
-    if (!ac) return;
-    const l = ac.addListener("place_changed", () => {
-      const p = ac.getPlace();
-      if (p.geometry?.location)
-        resolveAndPick(p.geometry.location.lat(), p.geometry.location.lng());
-    });
-    return () => google.maps.event.removeListener(l);
-  }, [ac, geocodingLib]);
+  const pick = (r: GeoResult) => {
+    onPick(r);
+    setQuery(r.address);
+    setResults([]);
+    setOpen(false);
+  };
 
   return (
     <div className="space-y-2">
-      <input
-        ref={inputRef}
-        type="text"
-        placeholder="Search address or place…"
-        className="w-full text-[11px] bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg p-2 outline-none focus:ring-2 focus:ring-primary/20 text-gray-800 dark:text-gray-200"
-      />
+      <div className="relative">
+        <input
+          type="text"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          onFocus={() => results.length && setOpen(true)}
+          placeholder="Search address or place…"
+          className="w-full text-[11px] bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg p-2 outline-none focus:ring-2 focus:ring-primary/20 text-gray-800 dark:text-gray-200"
+        />
+        {open && results.length > 0 && (
+          <div className="absolute z-20 left-0 right-0 mt-1 bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg shadow-lg max-h-40 overflow-y-auto no-scrollbar">
+            {results.map((r, idx) => (
+              <button
+                key={idx}
+                onClick={() => pick(r)}
+                className="w-full text-left px-2.5 py-1.5 text-[11px] text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-800 border-b border-gray-100 dark:border-gray-800 last:border-0 flex items-start gap-1.5"
+              >
+                <MapPin className="w-3 h-3 mt-0.5 shrink-0 text-primary" />
+                <span className="truncate">{r.address}</span>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
       <div className="h-40 rounded-lg overflow-hidden border border-gray-200 dark:border-gray-700">
         <GoogleMap
           defaultCenter={{ lat, lng }}
@@ -134,7 +152,7 @@ function LocationPickerInner({
           gestureHandling="greedy"
           onClick={(e) =>
             e.detail.latLng &&
-            resolveAndPick(e.detail.latLng.lat, e.detail.latLng.lng)
+            reverseAndPick(e.detail.latLng.lat, e.detail.latLng.lng)
           }
         >
           <MapRecenter lat={lat} lng={lng} />
@@ -142,7 +160,7 @@ function LocationPickerInner({
             position={{ lat, lng }}
             draggable
             onDragEnd={(e) =>
-              e.latLng && resolveAndPick(e.latLng.lat(), e.latLng.lng())
+              e.latLng && reverseAndPick(e.latLng.lat(), e.latLng.lng())
             }
           >
             <Pin background="#2F6F6A" borderColor="#1C2B2A" glyphColor="#fff" />
@@ -153,7 +171,7 @@ function LocationPickerInner({
         type="button"
         onClick={() =>
           navigator.geolocation?.getCurrentPosition((p) =>
-            resolveAndPick(p.coords.latitude, p.coords.longitude),
+            reverseAndPick(p.coords.latitude, p.coords.longitude),
           )
         }
         className="text-[10px] flex items-center gap-1.5 px-3 py-1.5 rounded-full font-bold uppercase tracking-wider border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors cursor-pointer"
@@ -173,13 +191,12 @@ function ChatLocationPicker(props: {
   if (!MAPS_KEY) {
     return (
       <p className="text-[10px] text-gray-500 dark:text-gray-400">
-        Map search unavailable (no Maps key) — the report uses your current
-        location.
+        Map unavailable (no Maps key) — the report uses your current location.
       </p>
     );
   }
   return (
-    <APIProvider apiKey={MAPS_KEY} libraries={["places", "geocoding"]}>
+    <APIProvider apiKey={MAPS_KEY}>
       <LocationPickerInner {...props} />
     </APIProvider>
   );
@@ -772,7 +789,13 @@ export default function CivicAssistant({
         }
       }
       const wards = await loadWardsConfig();
-      const zone = zoneForWard(nearestWard, wards) || "";
+      const official = await wardZoneAtPoint(f.latitude, f.longitude);
+      const officialWard = official?.ward || nearestWard;
+      const zone =
+        official?.zone ||
+        resolveZoneAuthoritative(nearestCity, nearestWard) ||
+        zoneForWard(nearestWard, wards) ||
+        "";
       const communityVerified =
         !f.forensicsFlagged && Boolean(f.matchedIssueId);
 
@@ -791,7 +814,7 @@ export default function CivicAssistant({
         latitude: f.latitude,
         longitude: f.longitude,
         address: f.locationText || "",
-        ward: nearestWard,
+        ward: officialWard,
         city: nearestCity,
         state: nearestState,
         zone,

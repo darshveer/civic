@@ -71,41 +71,58 @@ A modern, gamified civic engagement platform that connects citizens directly wit
 - **API Keys**: The ONLY real secrets are your `GEMINI_API_KEY` and `GOOGLE_MAPS_PLATFORM_KEY`. These belong in your `.env.local` file (which is gitignored) and must **NEVER** be hardcoded or committed to version control.
 - **Google Maps API**: Restrict your Google Maps API key by HTTP referrer in the Google Cloud Console to prevent unauthorized usage on other domains.
 - **Gemini API**: The Gemini API key is kept securely server-side and is never exposed to the client browser.
-- **Firestore Rules**: `firestore.rules` now enforces authentication and the municipal hierarchy: only signed-in users can read/write; a user may only edit their **own** profile and cannot set their own `role`; issue **status changes, assignment, and deletion** are allowed only for staff whose scope covers the issue's ward; the **purge/registry** is city-admin only; upvotes can only add/remove the caller's own uid and never on their own report. **Deploy the rules** (Firebase console → Firestore → Rules, or your AI Studio Firebase integration) for them to take effect.
+- **Firestore Rules**: `firestore.rules` enforces authentication and the municipal hierarchy: only signed-in users can read/write; a user may only edit their **own** profile and cannot set their own `role`; issue **status changes, assignment, and deletion** are allowed only for staff whose scope covers the issue's ward; the **staff registry** is writable only by a **City Administrator** or the bootstrap **admin email** (`adminEmails()` in the rules — set this to your email); a staff member's encrypted 2FA record (`staffSecurity/{uid}`) is **owner-only**; upvotes can only add/remove the caller's own uid and never on their own report. **Deploy the rules** (Firebase console → Firestore → Rules → Publish) for them to take effect.
 
-## Municipal Staff Hierarchy (RBAC) & Seeding
+## Municipal Staff Hierarchy (RBAC)
 
-Authoritative staff status lives in two Firestore documents (NOT in the client). Seed them once
-from the Firebase console (console writes bypass rules; after that only a city admin can edit them):
+Three staff tiers, modelled on Indian urban local bodies. A user's tier lives in the
+server-enforced `config/roles` registry (keyed by Firebase `uid`); Firestore rules enforce the
+exact same scope on every write, so the UI and the database always agree.
 
-**`config/roles`** — the staff registry, keyed by Firebase `uid`:
+| Tier | Who | What they can do |
+|------|-----|------------------|
+| **Ward Officer** (`field`) | Front-line officer for one or more **wards** | Sees and acts **only on issues in their assigned ward(s)**: verify/approve reports, change status, draft & send dispatch work-orders, and resolve issues (with the before/after photo check). Cannot touch issues outside their wards. |
+| **Zonal Supervisor** (`zonal`) | Supervisor over a **zone** (a group of wards) | Sees and acts on **every issue in their zone**, with a per-ward rollup. Acts as the **escalation tier** for overdue field issues, and oversees their ward officers. |
+| **City Administrator** (`city`) | Municipal commissioner level | Sees and acts on **everything**, manages the staff registry, and is the only tier that can **purge/reset** the database. |
 
-```json
-{
-  "staff": {
-    "<your-uid>":      { "tier": "city" },
-    "<zonal-uid>":     { "tier": "zonal", "zone": "Z-South" },
-    "<field-uid>":     { "tier": "field", "wards": ["Ward 12", "Ward 13"] }
-  }
-}
-```
+Scope is enforced by `canActOn()` in both [src/lib/roles.ts](src/lib/roles.ts) and
+[firestore.rules](firestore.rules): `city` → all issues; `zonal` → issues whose `zone` matches; `field` → issues whose `ward` is in their list.
 
-**`config/wards`** — maps each ward to its parent zone (used to stamp `zone` on new issues and to
-power the cascading filter):
+`config/wards` maps each ward to its parent zone (used to stamp `zone` on new issues and power the
+cascading **State → City → Zone → Ward** filter):
 
 ```json
 { "wardToZone": { "Ward 12": "Z-South", "Ward 13": "Z-South", "Ward 5": "Z-North" } }
 ```
 
-- **Field officers** see/act on issues only in their assigned `wards`.
-- **Zonal supervisors** see/act on every ward in their `zone` (with a per-ward rollup), and act as the next escalation tier for overdue field issues.
-- **City administrators** see everything and manage the registry and database reset.
+## Admin & staff accounts (no self-signup)
 
-**Bootstrap (demo convenience):** until `config/roles` has any entries, choosing the **Staff** tab
-on the login screen grants city-admin access in the UI so you can explore immediately. Note that
-Firestore rules still treat an unregistered uid as a citizen, so persistent staff actions (status
-changes, delete, purge) only work once you add your `uid` to `config/roles`. Find your `uid` in the
-Firebase console → Authentication.
+Staff are **never self-service** — there is no staff sign-up and **no Google sign-in for staff/admin**
+(staff use the email & password issued to them). Everything is provisioned from an in-app **Admin
+Panel** that only the administrator can open.
+
+**Admin gate (three server-checked factors, all in env):**
+- `ADMIN_EMAILS` — the admin email allowlist (also add the same email to `adminEmails()` in
+  [firestore.rules](firestore.rules) and deploy — that's what actually authorises writing the registry).
+- `ADMIN_SECRET_CODE` — the access "key" typed after login.
+- `ADMIN_TOTP_SECRET` — **compulsory authenticator (TOTP) 2FA**, verified server-side with Node
+  crypto (no Firebase MFA / Identity Platform / billing).
+
+**First-time admin setup:**
+1. Set `ADMIN_EMAILS`, `ADMIN_SECRET_CODE` in `.env.local`; add your email to `adminEmails()` in
+   `firestore.rules` and **deploy the rules** (Firebase console → Firestore → Rules → Publish).
+2. **Create your admin email/password account first** (so nobody else can claim that email), and
+   enable Email/Password in Firebase → Authentication.
+3. Sign in → **Admin** tab → "Set up the authenticator" → **scan the QR** (or enter the key) in
+   Google Authenticator/Authy → paste the same key into `ADMIN_TOTP_SECRET` → restart.
+4. Re-enter the Admin tab: access code + 6-digit code → **Make me City Administrator**, then add
+   staff (name, email, temporary password, tier, wards/zone). New staff accounts are created via a
+   secondary Firebase app, so creating them never disrupts your session.
+
+**Optional staff 2FA:** any staff member can turn on authenticator 2FA from **Account menu →
+Security & 2FA**. Their TOTP secret is **AES-encrypted with the server-only `STAFF_2FA_KEY`** before
+being stored in their own (owner-only) Firestore doc, so the database never holds a usable secret —
+verification always goes through the server. Set `STAFF_2FA_KEY` to enable the feature.
 
 ## How to Run
 

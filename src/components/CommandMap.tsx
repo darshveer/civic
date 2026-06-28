@@ -22,6 +22,7 @@ import { doc, updateDoc, arrayUnion } from "firebase/firestore";
 import type { User } from "firebase/auth";
 import { CivicIssue, UserScope } from "../types";
 import { canActOnIssue } from "../lib/roles";
+import { zoneCenter, wardsCenter } from "../lib/wardLookup";
 import { moderateComment } from "../lib/profanity";
 import { petitionEligible, PETITION_THRESHOLD } from "../lib/civic";
 import {
@@ -35,6 +36,18 @@ import {
 import { motion, AnimatePresence } from "motion/react";
 import confetti from "canvas-confetti";
 import { MarkerClusterer } from "@googlemaps/markerclusterer";
+
+// One distinct colour per BBMP zone (matches the dissolved zone boundaries).
+const ZONE_COLORS: Record<string, string> = {
+  East: "#EF4444",
+  West: "#3B82F6",
+  South: "#10B981",
+  Mahadevapura: "#F59E0B",
+  Bommanahalli: "#8B5CF6",
+  Yelahanka: "#EC4899",
+  Dasarahalli: "#14B8A6",
+  "RR Nagar": "#F97316",
+};
 
 interface CommandMapProps {
   issues: CivicIssue[];
@@ -300,14 +313,85 @@ function MapInner({
   selectedIssue,
   onMarkerClick,
   isDarkMode,
+  showWards,
+  showZones,
 }: {
   issues: CivicIssue[];
   selectedIssue: CivicIssue | null;
   onMarkerClick: (i: CivicIssue) => void;
   isDarkMode: boolean;
+  showWards: boolean;
+  showZones: boolean;
 }) {
   const map = useMap();
   const clusterer = useRef<MarkerClusterer | null>(null);
+  const wardLayer = useRef<google.maps.Data | null>(null);
+  const zoneLayer = useRef<google.maps.Data | null>(null);
+
+  // Load the BBMP ward + dissolved-zone boundaries (static GeoJSON in /public)
+  // once the map is ready. Wards are filled lightly by zone colour; zones get a
+  // thick coloured outline on top.
+  useEffect(() => {
+    if (!map) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const [wards, zones] = await Promise.all([
+          fetch("/bbmp-wards.geojson").then((r) => (r.ok ? r.json() : null)),
+          fetch("/bbmp-zones.geojson").then((r) => (r.ok ? r.json() : null)),
+        ]);
+        if (cancelled || !wards || !zones) return;
+        const wl = new google.maps.Data();
+        wl.addGeoJson(wards);
+        wl.setStyle((f) => {
+          const z = (f.getProperty("zone") as string) || "";
+          const c = ZONE_COLORS[z] || "#9CA3AF";
+          return {
+            fillColor: c,
+            fillOpacity: 0.07,
+            strokeColor: c,
+            strokeWeight: 0.7,
+            strokeOpacity: 0.5,
+            clickable: false,
+          };
+        });
+        const zl = new google.maps.Data();
+        zl.addGeoJson(zones);
+        zl.setStyle((f) => {
+          const z = (f.getProperty("zone") as string) || "";
+          const c = ZONE_COLORS[z] || "#374151";
+          return {
+            fillOpacity: 0,
+            strokeColor: c,
+            strokeWeight: 3.5,
+            strokeOpacity: 0.95,
+            clickable: false,
+            zIndex: 3,
+          };
+        });
+        wardLayer.current = wl;
+        zoneLayer.current = zl;
+        wl.setMap(showWards ? map : null);
+        zl.setMap(showZones ? map : null);
+      } catch (e) {
+        console.warn("Could not load ward/zone boundaries:", e);
+      }
+    })();
+    return () => {
+      cancelled = true;
+      wardLayer.current?.setMap(null);
+      zoneLayer.current?.setMap(null);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [map]);
+
+  // Independent ward / zone visibility toggles.
+  useEffect(() => {
+    wardLayer.current?.setMap(showWards && map ? map : null);
+  }, [showWards, map]);
+  useEffect(() => {
+    zoneLayer.current?.setMap(showZones && map ? map : null);
+  }, [showZones, map]);
 
   const [markers, setMarkers] = useState<{
     [key: string]: google.maps.marker.AdvancedMarkerElement;
@@ -406,6 +490,8 @@ export default function CommandMap({
   const [cityFilter, setCityFilter] = useState<string>("All");
   const [wardFilter, setWardFilter] = useState<string>("All");
   const [showLocationFilter, setShowLocationFilter] = useState(false);
+  const [showWards, setShowWards] = useState(false);
+  const [showZones, setShowZones] = useState(true);
   const [isSheetExpanded, setIsSheetExpanded] = useState(false);
   const [isImageModalOpen, setIsImageModalOpen] = useState(false);
   const [upvoteError, setUpvoteError] = useState<string | null>(null);
@@ -423,6 +509,28 @@ export default function CommandMap({
   const [center, setCenter] = useState<{ lat: number; lng: number }>(
     viewCenter,
   );
+  const [zoom, setZoom] = useState(13);
+
+  // Auto-centre the map on the staff member's jurisdiction: zonal supervisors on
+  // their zone, ward officers on their ward(s). City admins (and citizens) keep
+  // the default city-wide view. Selecting a specific report still overrides this.
+  useEffect(() => {
+    if (scope.role !== "staff" || scope.tier === "city") return;
+    let cancelled = false;
+    (async () => {
+      const c =
+        scope.tier === "zonal"
+          ? await zoneCenter(scope.zone)
+          : await wardsCenter(scope.wards);
+      if (cancelled || !c || selectedIssueFromParent) return;
+      setCenter(c);
+      setZoom(scope.tier === "zonal" ? 12 : 14);
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scope.role, scope.tier, scope.zone, scope.wards.join(",")]);
 
   useEffect(() => {
     if (selectedIssueFromParent) {
@@ -701,7 +809,10 @@ export default function CommandMap({
                 setCenter(e.detail.center);
               }
             }}
-            defaultZoom={13}
+            zoom={zoom}
+            onZoomChanged={(e) => {
+              if (typeof e.detail?.zoom === "number") setZoom(e.detail.zoom);
+            }}
             mapId="DEMO_MAP_ID"
             colorScheme={isDarkMode ? "DARK" : "LIGHT"}
             internalUsageAttributionIds={["gmp_mcp_codeassist_v1_aistudio"]}
@@ -714,8 +825,56 @@ export default function CommandMap({
               selectedIssue={selectedIssue}
               onMarkerClick={handleMarkerClick}
               isDarkMode={isDarkMode || false}
+              showWards={showWards}
+              showZones={showZones}
             />
           </GoogleMap>
+
+          {/* Boundary toggles + zone legend */}
+          <div className="absolute top-3 right-3 z-10 flex flex-col items-end gap-2">
+            <div className="flex gap-1.5">
+              <button
+                onClick={() => setShowZones((v) => !v)}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-[11px] font-bold uppercase tracking-wider shadow-md backdrop-blur transition-colors cursor-pointer border ${
+                  showZones
+                    ? "bg-primary text-white border-primary"
+                    : "bg-white/90 dark:bg-gray-900/90 text-gray-700 dark:text-gray-200 border-gray-200 dark:border-gray-700"
+                }`}
+              >
+                Zones {showZones ? "On" : "Off"}
+              </button>
+              <button
+                onClick={() => setShowWards((v) => !v)}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-[11px] font-bold uppercase tracking-wider shadow-md backdrop-blur transition-colors cursor-pointer border ${
+                  showWards
+                    ? "bg-primary text-white border-primary"
+                    : "bg-white/90 dark:bg-gray-900/90 text-gray-700 dark:text-gray-200 border-gray-200 dark:border-gray-700"
+                }`}
+              >
+                Wards {showWards ? "On" : "Off"}
+              </button>
+            </div>
+            {showZones && (
+              <div className="bg-white/90 dark:bg-gray-900/90 backdrop-blur rounded-xl shadow-md border border-gray-200 dark:border-gray-700 p-2.5 max-w-[9rem]">
+                <p className="text-[9px] font-bold uppercase tracking-wider text-gray-400 mb-1.5">
+                  BBMP Zones
+                </p>
+                <div className="grid grid-cols-1 gap-1">
+                  {Object.entries(ZONE_COLORS).map(([z, c]) => (
+                    <div key={z} className="flex items-center gap-1.5">
+                      <span
+                        className="w-3 h-1.5 rounded-sm shrink-0"
+                        style={{ backgroundColor: c }}
+                      />
+                      <span className="text-[10px] text-gray-700 dark:text-gray-300 truncate">
+                        {z}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
         </APIProvider>
       )}
 

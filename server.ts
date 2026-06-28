@@ -5,6 +5,7 @@
 
 import express from "express";
 import path from "path";
+import crypto from "crypto";
 import nodemailer from "nodemailer";
 import dotenv from "dotenv";
 import { createServer as createViteServer } from "vite";
@@ -45,6 +46,7 @@ import {
   runPetitionAgent,
   runMissionsCoachAgent,
   runDispatchAgent,
+  runZoneMappingAgent,
   getHaversineDistanceMeters,
 } from "./server/gemini";
 import { CivicCategory } from "./src/types";
@@ -703,6 +705,319 @@ app.post("/api/send-dispatch", async (req, res) => {
   } catch (e: any) {
     console.error("[Dispatch] SMTP send failed:", e?.message || e);
     return res.status(502).json({ error: "Failed to send the dispatch email." });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Admin gate — provisioning staff is restricted to the env-configured admin(s).
+//
+//   ADMIN_EMAILS       comma-separated admin email allowlist
+//   ADMIN_SECRET_CODE  the "key" entered after login (only you know it)
+//   ADMIN_TOTP_SECRET  base32 secret for the authenticator app (compulsory 2FA)
+//
+// All three are checked server-side. TOTP (RFC 6238, SHA1/6-digit/30s) is
+// implemented with Node crypto — no dependency, no billing, no Firebase MFA.
+// NOTE: the REAL authority to write config/roles is the Firestore rule that
+// allows the admin email; this gate is the app-level lock on top.
+// ---------------------------------------------------------------------------
+const B32 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+
+function base32Decode(input: string): Buffer {
+  const clean = input.replace(/=+$/, "").toUpperCase().replace(/\s+/g, "");
+  let bits = 0;
+  let value = 0;
+  const out: number[] = [];
+  for (const ch of clean) {
+    const idx = B32.indexOf(ch);
+    if (idx === -1) continue;
+    value = (value << 5) | idx;
+    bits += 5;
+    if (bits >= 8) {
+      out.push((value >>> (bits - 8)) & 0xff);
+      bits -= 8;
+    }
+  }
+  return Buffer.from(out);
+}
+
+function base32Encode(buf: Buffer): string {
+  let bits = 0;
+  let value = 0;
+  let out = "";
+  for (const b of buf) {
+    value = (value << 8) | b;
+    bits += 8;
+    while (bits >= 5) {
+      out += B32[(value >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+  }
+  if (bits > 0) out += B32[(value << (5 - bits)) & 31];
+  return out;
+}
+
+function hotp(secret: Buffer, counter: number): string {
+  const buf = Buffer.alloc(8);
+  buf.writeBigUInt64BE(BigInt(counter));
+  const hmac = crypto.createHmac("sha1", secret).update(buf).digest();
+  const offset = hmac[hmac.length - 1] & 0xf;
+  const code =
+    ((hmac[offset] & 0x7f) << 24) |
+    ((hmac[offset + 1] & 0xff) << 16) |
+    ((hmac[offset + 2] & 0xff) << 8) |
+    (hmac[offset + 3] & 0xff);
+  return (code % 1_000_000).toString().padStart(6, "0");
+}
+
+/** Verifies a 6-digit TOTP against a base32 secret (±1 time-step tolerance). */
+function verifyTotp(token: string, base32Secret: string): boolean {
+  if (!base32Secret || !/^\d{6}$/.test(token)) return false;
+  const secret = base32Decode(base32Secret);
+  const step = Math.floor(Date.now() / 1000 / 30);
+  for (let i = -1; i <= 1; i++) {
+    if (hotp(secret, step + i) === token) return true;
+  }
+  return false;
+}
+
+function adminEmails(): string[] {
+  return (process.env.ADMIN_EMAILS || "")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+}
+function isAdminEmail(email: string): boolean {
+  return adminEmails().includes(String(email || "").trim().toLowerCase());
+}
+function safeEqual(a: string, b: string): boolean {
+  const ab = Buffer.from(a);
+  const bb = Buffer.from(b);
+  return ab.length === bb.length && crypto.timingSafeEqual(ab, bb);
+}
+
+/** Lightweight check so the client knows whether to show the Admin Panel. */
+app.post("/api/admin/whoami", (req, res) => {
+  return res.json({ isAdmin: isAdminEmail(req.body?.email) });
+});
+
+/**
+ * Returns an authenticator-app secret + otpauth URI for first-time 2FA setup.
+ * Gated by the admin email + access code so the secret isn't world-readable. If
+ * ADMIN_TOTP_SECRET is already set, returns it (to re-add on a new device);
+ * otherwise generates one to COPY into the env var.
+ */
+app.post("/api/admin/totp-setup", (req, res) => {
+  const email = String(req.body?.email || "").trim().toLowerCase();
+  if (!isAdminEmail(email))
+    return res.status(403).json({ error: "Not an admin account." });
+  const expected = process.env.ADMIN_SECRET_CODE || "";
+  if (!expected)
+    return res
+      .status(503)
+      .json({ error: "ADMIN_SECRET_CODE is not set on the server." });
+  if (!safeEqual(String(req.body?.secretCode || ""), expected))
+    return res.status(401).json({ error: "Enter the correct admin access code first." });
+
+  const existing = process.env.ADMIN_TOTP_SECRET || "";
+  const secret = existing || base32Encode(crypto.randomBytes(20));
+  const label = encodeURIComponent(`CIVIC Admin (${email})`);
+  const otpauth = `otpauth://totp/${label}?secret=${secret}&issuer=CIVIC&algorithm=SHA1&digits=6&period=30`;
+  return res.json({ secret, otpauth, alreadyConfigured: Boolean(existing) });
+});
+
+/**
+ * Full admin verification: email allowlist + access code + authenticator code.
+ * On success the client unlocks the provisioning panel. (Firestore rules still
+ * independently gate the actual config/roles writes by the admin email.)
+ */
+app.post("/api/admin/verify", (req, res) => {
+  const email = String(req.body?.email || "").trim().toLowerCase();
+  if (!isAdminEmail(email))
+    return res.status(403).json({ error: "This account is not an administrator." });
+
+  const expectedCode = process.env.ADMIN_SECRET_CODE || "";
+  if (!expectedCode)
+    return res
+      .status(503)
+      .json({ error: "Admin access code not configured (set ADMIN_SECRET_CODE)." });
+  if (!safeEqual(String(req.body?.secretCode || ""), expectedCode))
+    return res.status(401).json({ error: "Incorrect admin access code." });
+
+  const totpSecret = process.env.ADMIN_TOTP_SECRET || "";
+  if (!totpSecret)
+    return res.status(503).json({
+      error: "2FA isn't set up yet — use “Set up authenticator” to configure ADMIN_TOTP_SECRET.",
+    });
+  if (!verifyTotp(String(req.body?.totpCode || "").trim(), totpSecret))
+    return res.status(401).json({ error: "Invalid authenticator code." });
+
+  return res.json({ ok: true });
+});
+
+// ---------------------------------------------------------------------------
+// Optional per-staff 2FA (authenticator app), enabled from a staff member's
+// profile. The TOTP secret is AES-256-GCM encrypted with a SERVER-ONLY key
+// (STAFF_2FA_KEY) before the client stores it in their own Firestore doc — so
+// reading that doc reveals only ciphertext, and verification must come through
+// the server. (No firebase-admin / Identity Platform / billing required.)
+// ---------------------------------------------------------------------------
+function staff2faKey(): Buffer | null {
+  const k = process.env.STAFF_2FA_KEY;
+  if (!k) return null;
+  return crypto.createHash("sha256").update(k).digest(); // 32-byte AES key
+}
+function encryptSecret(secret: string): string {
+  const key = staff2faKey() as Buffer;
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+  const ct = Buffer.concat([cipher.update(secret, "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return Buffer.concat([iv, tag, ct]).toString("base64");
+}
+function decryptSecret(blob: string): string | null {
+  try {
+    const key = staff2faKey() as Buffer;
+    const raw = Buffer.from(blob, "base64");
+    const iv = raw.subarray(0, 12);
+    const tag = raw.subarray(12, 28);
+    const ct = raw.subarray(28);
+    const d = crypto.createDecipheriv("aes-256-gcm", key, iv);
+    d.setAuthTag(tag);
+    return Buffer.concat([d.update(ct), d.final()]).toString("utf8");
+  } catch {
+    return null;
+  }
+}
+
+// New secret + otpauth URI for staff enrollment (client renders the QR).
+app.post("/api/staff/2fa/setup", (req, res) => {
+  if (!staff2faKey())
+    return res
+      .status(503)
+      .json({ error: "Staff 2FA isn't enabled on the server (set STAFF_2FA_KEY)." });
+  const label = encodeURIComponent(`CIVIC Staff (${String(req.body?.email || "staff")})`);
+  const secret = base32Encode(crypto.randomBytes(20));
+  const otpauth = `otpauth://totp/${label}?secret=${secret}&issuer=CIVIC&algorithm=SHA1&digits=6&period=30`;
+  return res.json({ secret, otpauth });
+});
+
+// Confirm the authenticator works, then hand back the ENCRYPTED secret to store.
+app.post("/api/staff/2fa/enroll", (req, res) => {
+  if (!staff2faKey())
+    return res.status(503).json({ error: "Staff 2FA isn't enabled on the server." });
+  const secret = String(req.body?.secret || "");
+  const code = String(req.body?.code || "").trim();
+  if (!verifyTotp(code, secret))
+    return res
+      .status(401)
+      .json({ error: "That code didn't match — check your authenticator and try again." });
+  return res.json({ enc: encryptSecret(secret) });
+});
+
+// Verify a login challenge against the stored ciphertext. Rate-limited.
+const twofaAttempts = new Map<string, { count: number; reset: number }>();
+app.post("/api/staff/2fa/verify", (req, res) => {
+  if (!staff2faKey())
+    return res.status(503).json({ error: "Staff 2FA isn't enabled on the server." });
+  const enc = String(req.body?.enc || "");
+  const code = String(req.body?.code || "").trim();
+  const keyId = crypto.createHash("sha256").update(enc).digest("hex").slice(0, 16);
+  const now = Date.now();
+  const rec = twofaAttempts.get(keyId);
+  if (rec && now < rec.reset && rec.count >= 10)
+    return res.status(429).json({ error: "Too many attempts — wait a few minutes." });
+
+  const secret = decryptSecret(enc);
+  if (!secret) return res.status(400).json({ error: "Corrupt 2FA record." });
+  if (!verifyTotp(code, secret)) {
+    const r = rec && now < rec.reset ? rec : { count: 0, reset: now + 5 * 60 * 1000 };
+    r.count += 1;
+    twofaAttempts.set(keyId, r);
+    return res.status(401).json({ error: "Invalid authenticator code." });
+  }
+  twofaAttempts.delete(keyId);
+  return res.json({ ok: true });
+});
+
+/**
+ * Auto-maps the city's ward names to municipal zones (Gemini). The Admin Panel
+ * passes the distinct ward names found in the issues; the result is written to
+ * config/wards and used to backfill issue zones — no manual mapping needed.
+ */
+app.post("/api/admin/map-zones", async (req, res) => {
+  const wards = Array.isArray(req.body?.wards) ? req.body.wards : [];
+  const city = String(req.body?.city || "");
+  const state = String(req.body?.state || "");
+  try {
+    const wardToZone = await runZoneMappingAgent(wards, city, state);
+    return res.json({ success: true, wardToZone });
+  } catch (err: any) {
+    return res
+      .status(500)
+      .json({ error: err?.message || "Zone mapping failed." });
+  }
+});
+
+/**
+ * Emails a newly-provisioned staff member their temporary password. Called by
+ * the Admin Panel right after the account is created. Reuses the SMTP mailer;
+ * in local dev without SMTP it logs (and reports simulated) so the flow works.
+ */
+const STAFF_TIER_LABEL: Record<string, string> = {
+  field: "Ward Officer",
+  zonal: "Zonal Supervisor",
+  city: "City Administrator",
+};
+app.post("/api/staff/invite", async (req, res) => {
+  const to = String(req.body?.email || "").trim().toLowerCase();
+  const password = String(req.body?.password || "");
+  const name = String(req.body?.name || "").trim() || "there";
+  const tier = STAFF_TIER_LABEL[String(req.body?.tier || "")] || "staff";
+  if (!EMAIL_RE.test(to))
+    return res.status(400).json({ error: "A valid email is required." });
+  if (!password)
+    return res.status(400).json({ error: "Password is required." });
+
+  const appUrl = process.env.APP_URL || "";
+  const subject = "Your C.I.V.I.C. staff account";
+  const text = `Hi ${name},
+
+A C.I.V.I.C. ${tier} account has been created for you.
+
+Sign in on the "Staff / Admin" tab${appUrl ? ` at ${appUrl}` : ""} with:
+  Email:    ${to}
+  Password: ${password}
+
+This is a TEMPORARY password — you'll be asked to set your own on first sign-in.
+Do not share it. Sign in with email & password (not Google).
+
+— C.I.V.I.C.`;
+  const html = `<div style="font-family:sans-serif;line-height:1.5">
+<p>Hi ${name},</p>
+<p>A C.I.V.I.C. <strong>${tier}</strong> account has been created for you.</p>
+<p>Sign in on the <strong>Staff / Admin</strong> tab${appUrl ? ` at <a href="${appUrl}">${appUrl}</a>` : ""} with:</p>
+<p style="background:#f3f4f6;padding:10px;border-radius:8px">
+Email: <strong>${to}</strong><br/>Temporary password: <strong>${password}</strong></p>
+<p>You'll be asked to set your own password on first sign-in. Do not share this, and sign in with email &amp; password (not Google).</p>
+<p>— C.I.V.I.C.</p></div>`;
+
+  const mailer = getMailer();
+  const isProd = process.env.NODE_ENV === "production";
+  if (!mailer) {
+    if (isProd)
+      return res
+        .status(503)
+        .json({ error: "Email isn't configured on the server (set SMTP_* env vars)." });
+    console.log(`[Invite] (simulated) → ${to} :: temp password ${password}`);
+    return res.json({ success: true, sent: false, simulated: true });
+  }
+  try {
+    const from = process.env.OTP_FROM_EMAIL || process.env.SMTP_USER || "CIVIC";
+    await mailer.sendMail({ from, to, subject, text, html });
+    return res.json({ success: true, sent: true });
+  } catch (e: any) {
+    console.error("[Invite] SMTP send failed:", e?.message || e);
+    return res.status(502).json({ error: "Failed to send the invite email." });
   }
 });
 

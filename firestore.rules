@@ -31,6 +31,20 @@ service cloud.firestore {
     function isZonal(u) { return isStaff(u) && member(u).tier == 'zonal'; }
     function isField(u) { return isStaff(u) && member(u).tier == 'field'; }
 
+    // Bootstrap administrator(s): the source of authority to write the staff
+    // registry, identified by the signed-in account's email.
+    // EDIT this list to YOUR admin email(s) and DEPLOY the rules. Keep it in
+    // sync with the server's ADMIN_EMAILS env var.
+    //
+    // SECURITY: create your admin email/password account FIRST (before exposing
+    // the app) so nobody else can register that email. The in-app Admin Panel
+    // adds a second lock on top (access code + authenticator 2FA).
+    function adminEmails() { return ['dveers@outlook.com']; }
+    function isAdmin() {
+      return isSignedIn()
+        && (request.auth.token.get('email', '') in adminEmails());
+    }
+
     // Does the signed-in staff member's scope cover this issue?
     function canActOn(issue) {
       return isCity(uid())
@@ -39,9 +53,12 @@ service cloud.firestore {
     }
 
     // ----- config: registry + ward map ------------------------------------
+    // City admins OR the bootstrap admin email may manage the registry. The
+    // admin-email path lets you provision the very first staff (incl. yourself)
+    // without a console seed; thereafter city admins can manage it too.
     match /config/{docId} {
       allow read:  if isSignedIn();
-      allow write: if isCity(uid());
+      allow write: if isCity(uid()) || isAdmin();
     }
 
     // ----- citizens: profiles ---------------------------------------------
@@ -56,7 +73,27 @@ service cloud.firestore {
         && citizenId == uid()
         && request.resource.data.get('uid', uid()) == resource.data.get('uid', uid())
         && request.resource.data.get('role', 'citizen') == resource.data.get('role', 'citizen');
-      allow delete: if isCity(uid());
+      // A City Admin or the bootstrap admin may delete a profile (e.g. when
+      // fully removing a staff member from the app).
+      allow delete: if isCity(uid()) || isAdmin();
+    }
+
+    // ----- staffSecurity: per-user optional 2FA -----------------------------
+    // Holds only the AES-ENCRYPTED TOTP secret (ciphertext) + an enabled flag.
+    // Strictly owner-only for read/write; a City Admin or bootstrap admin may
+    // delete it when removing the staff member. (The ciphertext is meaningless
+    // without the server's STAFF_2FA_KEY anyway.)
+    match /staffSecurity/{docId} {
+      allow read, write: if isSignedIn() && docId == uid();
+      allow delete: if isCity(uid()) || isAdmin();
+    }
+
+    // ----- staffOnboarding: first-login "must change password" flag ---------
+    // The admin sets it when provisioning a staff account; the owner reads it
+    // and clears it after changing their temporary password.
+    match /staffOnboarding/{docId} {
+      allow read:  if isSignedIn() && docId == uid();
+      allow write: if isAdmin() || isCity(uid()) || (isSignedIn() && docId == uid());
     }
 
     // ----- issues ----------------------------------------------------------

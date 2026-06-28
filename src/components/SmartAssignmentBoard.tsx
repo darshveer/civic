@@ -7,7 +7,7 @@ import React, { useState, useEffect } from "react";
 import { CivicIssue, CivicStatus, CivicCategory, UserScope } from "../types";
 import type { User } from "firebase/auth";
 import { db, corroborateAndApprove } from "../lib/firebase";
-import { canActOnIssue } from "../lib/roles";
+import { canActOnIssue, statusOptions, statusLabel } from "../lib/roles";
 import { doc, updateDoc } from "firebase/firestore";
 import {
   LayoutDashboard,
@@ -54,19 +54,6 @@ const COLUMNS: { key: string; label: string; statuses: CivicStatus[] }[] = [
   },
   { key: "in-progress", label: "In Progress", statuses: ["In Progress"] },
   { key: "resolved", label: "Resolved", statuses: ["Resolved"] },
-];
-
-const ALL_STATUSES: CivicStatus[] = [
-  "Reported",
-  "Auto-Routed",
-  "Requires Human Verification",
-  "Corroborated Report",
-  "Pending Verification",
-  "Community Verified",
-  "Staff Verified",
-  "Flagged for Review",
-  "In Progress",
-  "Resolved",
 ];
 
 const CATEGORIES: (CivicCategory | "All")[] = [
@@ -318,9 +305,9 @@ export default function SmartAssignmentBoard({
             onChange={(e) => setStatus(issue, e.target.value as CivicStatus)}
             className="w-full text-[10px] min-h-[38px] bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded-lg px-2 font-bold text-gray-700 dark:text-gray-200 focus:outline-none focus:ring-2 focus:ring-primary cursor-pointer"
           >
-            {ALL_STATUSES.map((s) => (
+            {statusOptions(issue.status).map((s) => (
               <option key={s} value={s}>
-                Move: {s}
+                Move: {statusLabel(s)}
               </option>
             ))}
           </select>
@@ -665,9 +652,9 @@ export default function SmartAssignmentBoard({
                   }
                   className="w-full text-xs min-h-[44px] bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded-xl px-3 font-bold text-gray-700 dark:text-gray-200 focus:outline-none focus:ring-2 focus:ring-primary cursor-pointer"
                 >
-                  {ALL_STATUSES.map((s) => (
+                  {statusOptions(liveDetail.status).map((s) => (
                     <option key={s} value={s}>
-                      {s}
+                      {statusLabel(s)}
                     </option>
                   ))}
                 </select>

@@ -1,17 +1,29 @@
+# Dependencies & build output
 node_modules/
 build/
 dist/
 coverage/
+
+# OS / logs
 .DS_Store
 *.log
+
+# Environment & secrets (keep the example)
 .env*
 !.env.example
 *.pem
 *.key
 *service-account*.json
 *.credentials.json
-<<<<<<< Updated upstream
-=======
-AI_STUDIO_PROMPTS.md
+
+# Firebase CLI artifacts (if you use the CLI to deploy rules)
+.firebase/
+firebase-debug.log
+.firebaserc
+
+# Packaged uploads
+*.zip
+
+# Tooling / local notes
 .claude/
->>>>>>> Stashed changes
+AI_STUDIO_PROMPTS.md

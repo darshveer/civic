@@ -2024,3 +2024,71 @@ Context: ${JSON.stringify(ctx)}`,
       : "Thanks for being an active Civic Hero — keep reporting and corroborating to grow your impact!";
   }
 }
+
+/**
+ * Zone-Mapping Agent — groups the city's actual ward / neighbourhood names into
+ * municipal ZONES (a zone contains several wards), so the ward→zone map can be
+ * generated automatically instead of maintained by hand. Returns a plain
+ * { ward: zone } object. Falls back to an empty map on failure (callers keep
+ * any manual entries).
+ */
+export async function runZoneMappingAgent(
+  wards: string[],
+  city: string,
+  state: string,
+): Promise<Record<string, string>> {
+  const clean = Array.from(
+    new Set(
+      (wards || [])
+        .map((w) => String(w || "").trim())
+        .filter((w) => w.length > 0),
+    ),
+  ).slice(0, 200);
+  if (clean.length === 0) return {};
+
+  const where = [city, state].filter(Boolean).join(", ") || "this city";
+  try {
+    const response = await generateWithFallback({
+      model: "gemini-2.5-flash",
+      contents: [
+        `You are a municipal GIS assistant for ${where}. Group each of the following
+wards / neighbourhoods into its administrative ZONE. A zone is a larger division that
+contains several wards. Use REAL municipal zone names where you know them (for example,
+BBMP Bengaluru zones are: East, South, West, Yelahanka, Mahadevapura, Bommanahalli,
+Rajarajeshwari Nagar, Dasarahalli, and Bommanahalli). If you are unsure, group them
+geographically into a small number of sensible zones (e.g. "North", "South", "East",
+"West", "Central"). EVERY ward must be assigned exactly one zone.
+
+Wards: ${JSON.stringify(clean)}`,
+      ],
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.ARRAY,
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              ward: { type: Type.STRING },
+              zone: { type: Type.STRING },
+            },
+            required: ["ward", "zone"],
+          },
+        },
+      },
+    });
+    const arr = JSON.parse(response.text || "[]") as {
+      ward?: string;
+      zone?: string;
+    }[];
+    const map: Record<string, string> = {};
+    for (const r of arr) {
+      const w = String(r?.ward || "").trim();
+      const z = String(r?.zone || "").trim();
+      if (w && z && clean.includes(w)) map[w] = z;
+    }
+    return map;
+  } catch (err: any) {
+    console.error("Zone Mapping Agent failed:", err?.message || err);
+    return {};
+  }
+}

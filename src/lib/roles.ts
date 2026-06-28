@@ -19,6 +19,7 @@ import { doc, getDoc } from "firebase/firestore";
 import { db } from "./firebase";
 import {
   CivicIssue,
+  CivicStatus,
   RolesConfig,
   StaffTier,
   UserScope,
@@ -26,6 +27,46 @@ import {
 } from "../types";
 
 const CITIZEN_SCOPE: UserScope = { role: "citizen", wards: [] };
+
+/**
+ * The only statuses staff may assign from the dashboard/board.
+ *
+ * Deliberately excluded:
+ *  - "Reported"                     → reports auto-route on submission.
+ *  - "Requires Human Verification"  → duplicated "Flagged for Review".
+ *  - "Corroborated Report"          → same outcome as "Staff Verified".
+ *  - "Community Verified"           → earned by community consensus, never set
+ *                                     by staff (they promote to Staff Verified).
+ * These legacy/community values remain in CivicStatus so existing reports still
+ * render; they're simply not offered as choices.
+ */
+export const STAFF_ASSIGNABLE_STATUSES: CivicStatus[] = [
+  "Auto-Routed",
+  "Pending Verification",
+  "Staff Verified",
+  "Flagged for Review",
+  "In Progress",
+  "Resolved",
+];
+
+/**
+ * Status options for an editable dropdown bound to `current`. Guarantees the
+ * issue's current status is always selectable — even when it's a legacy or
+ * community-only value no longer offered for new assignment — so the control
+ * never renders blank.
+ */
+export function statusOptions(current: CivicStatus): CivicStatus[] {
+  return STAFF_ASSIGNABLE_STATUSES.includes(current)
+    ? STAFF_ASSIGNABLE_STATUSES
+    : [current, ...STAFF_ASSIGNABLE_STATUSES];
+}
+
+/** Human-readable label for the few statuses whose stored value differs. */
+export function statusLabel(status: CivicStatus | string): string {
+  if (status === "Requires Human Verification") return "Verify Report";
+  if (status === "Corroborated Report") return "Corroborated";
+  return status;
+}
 
 /**
  * Loads the staff registry. Returns an empty registry if the doc is missing or
