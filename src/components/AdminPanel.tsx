@@ -4,6 +4,7 @@
  */
 
 import React, { useEffect, useState } from "react";
+import { T } from "../lib/translate";
 import type { User } from "firebase/auth";
 import { initializeApp, getApps, getApp } from "firebase/app";
 import {
@@ -470,10 +471,10 @@ export default function AdminPanel({ currentUser, issues }: AdminPanelProps) {
             </div>
             <div>
               <h2 className="text-lg font-bold text-gray-900 dark:text-white">
-                Admin Access
+                <T>Admin Access</T>
               </h2>
               <p className="text-xs text-gray-500 dark:text-gray-400">
-                Enter your access code and authenticator code.
+                <T>Enter your access code and authenticator code.</T>
               </p>
             </div>
           </div>
@@ -528,7 +529,7 @@ export default function AdminPanel({ currentUser, issues }: AdminPanelProps) {
                   </p>
                 ) : (
                   <p>
-                    <strong>Scan</strong> this QR in Google Authenticator / Authy
+                    <strong><T>Scan</T></strong> this QR in Google Authenticator / Authy
                     (or enter the key manually), then set{" "}
                     <code>ADMIN_TOTP_SECRET</code> to the key in your server env
                     and restart:
@@ -568,7 +569,7 @@ export default function AdminPanel({ currentUser, issues }: AdminPanelProps) {
         </div>
         <div>
           <h2 className="text-xl font-bold text-gray-900 dark:text-white">
-            Staff Administration
+            <T>Staff Administration</T>
           </h2>
           <p className="text-xs text-gray-500 dark:text-gray-400">
             Signed in as {email}
@@ -595,7 +596,7 @@ export default function AdminPanel({ currentUser, issues }: AdminPanelProps) {
             <Crown className="w-4 h-4 text-amber-500" /> Make me City Administrator
           </p>
           <p className="text-xs text-gray-500 dark:text-gray-400">
-            Adds your account to the registry so you can act on all issues.
+            <T>Adds your account to the registry so you can act on all issues.</T>
           </p>
         </div>
         <button
@@ -603,7 +604,7 @@ export default function AdminPanel({ currentUser, issues }: AdminPanelProps) {
           disabled={busy}
           className="shrink-0 bg-gray-900 dark:bg-white text-white dark:text-gray-900 text-xs font-bold uppercase tracking-wider px-4 py-2 rounded-full hover:opacity-90 disabled:opacity-60 cursor-pointer transition-opacity"
         >
-          Grant
+          <T>Grant</T>
         </button>
       </div>
 
@@ -629,7 +630,7 @@ export default function AdminPanel({ currentUser, issues }: AdminPanelProps) {
         <p className="text-xs text-gray-500 dark:text-gray-400">
           New reports are tagged with their official BBMP ward &amp; zone
           automatically (by the boundary they fall inside). Run this once to
-          re-stamp <strong>existing</strong> issues so zonal supervisors and ward
+          re-stamp <strong><T>existing</T></strong> issues so zonal supervisors and ward
           officers see them. No need to re-run unless boundaries change.
         </p>
 
@@ -647,7 +648,7 @@ export default function AdminPanel({ currentUser, issues }: AdminPanelProps) {
         {zoneOptions.length > 0 && (
           <div>
             <p className="text-[10px] font-bold text-gray-400 uppercase tracking-wider mb-1.5">
-              Zones (assign these to zonal supervisors)
+              <T>Zones (assign these to zonal supervisors)</T>
             </p>
             <div className="flex flex-wrap gap-1.5">
               {zoneOptions.map((z) => (
@@ -666,11 +667,11 @@ export default function AdminPanel({ currentUser, issues }: AdminPanelProps) {
       {/* Staffing limits (per-area quotas) */}
       <div className="glass-card rounded-2xl p-5 space-y-3">
         <h3 className="text-sm font-bold text-gray-900 dark:text-white">
-          Staffing limits
+          <T>Staffing limits</T>
         </h3>
         <div className="grid grid-cols-2 gap-3">
           <label className="text-xs text-gray-600 dark:text-gray-300">
-            Zonal supervisors / zone
+            <T>Zonal supervisors / zone</T>
             <input
               type="number"
               min={1}
@@ -685,7 +686,7 @@ export default function AdminPanel({ currentUser, issues }: AdminPanelProps) {
             />
           </label>
           <label className="text-xs text-gray-600 dark:text-gray-300">
-            Ward officers / ward
+            <T>Ward officers / ward</T>
             <input
               type="number"
               min={1}
@@ -844,7 +845,7 @@ export default function AdminPanel({ currentUser, issues }: AdminPanelProps) {
         </div>
         {staffEntries.length === 0 ? (
           <p className="text-xs text-gray-400 dark:text-gray-500">
-            No staff yet. Add yourself as City Administrator and create officers above.
+            <T>No staff yet. Add yourself as City Administrator and create officers above.</T>
           </p>
         ) : (
           <div className="space-y-2">
@@ -889,7 +890,7 @@ export default function AdminPanel({ currentUser, issues }: AdminPanelProps) {
         <div className="mt-4 pt-3 border-t border-gray-100 dark:border-gray-800">
           <p className="text-[10px] text-gray-400 dark:text-gray-500 mb-2">
             Removing a member revokes their role and deletes their app data. The
-            Firebase Auth <strong>login</strong> can't be deleted from here
+            Firebase Auth <strong><T>login</T></strong> can't be deleted from here
             (client SDK limitation) — finish the job with one click:
           </p>
           <a

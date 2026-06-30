@@ -7,6 +7,8 @@ import React, { useState, useMemo, useEffect } from "react";
 import type { User } from "firebase/auth";
 import { Sparkles, Target } from "lucide-react";
 import { CitizenProfile, LeaderboardEntry, CivicIssue } from "../types";
+import { aiLanguageName } from "../i18n";
+import { T } from "../lib/translate";
 import {
   calculateCivicRank,
   computeImpactPoints,
@@ -76,7 +78,7 @@ export default function ImpactDashboard({
     fetch("/api/missions-coach", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ context: ctx }),
+      body: JSON.stringify({ context: ctx, language: aiLanguageName() }),
     })
       .then((r) => r.json())
       .then((d) => {
@@ -128,7 +130,7 @@ export default function ImpactDashboard({
             resolved: liveResolvedCount,
             points: liveImpactPoints,
           },
-          language: "English",
+          language: aiLanguageName(),
         }),
       });
       const data = await response.json();
@@ -184,7 +186,7 @@ export default function ImpactDashboard({
           <Sparkles className="w-4 h-4 text-emerald-500" />
         </div>
         <h3 className="text-sm font-bold uppercase tracking-widest text-gray-700 dark:text-gray-200">
-          Your Missions
+          <T>Your Missions</T>
         </h3>
       </div>
       {coach && (
@@ -218,7 +220,7 @@ export default function ImpactDashboard({
           <div className="flex justify-between items-end mb-4">
             <div>
               <h2 className="text-2xl sm:text-3xl font-display font-bold tracking-tight text-[#1A1A1A] dark:text-white mb-1">
-                Your Impact
+                <T>Your Impact</T>
               </h2>
               <p className="text-sm text-[#717171] dark:text-gray-400">
                 {currentProfile?.displayName}
@@ -227,7 +229,7 @@ export default function ImpactDashboard({
             <div className="text-2xl sm:text-3xl font-light text-primary shrink-0">
               {liveImpactPoints}{" "}
               <span className="text-sm font-bold text-semantic-success">
-                pts
+                <T>pts</T>
               </span>
             </div>
           </div>
@@ -275,7 +277,7 @@ export default function ImpactDashboard({
                 {liveReportsCount}
               </span>
               <span className="text-[10px] uppercase tracking-widest font-bold text-[#717171] dark:text-gray-400">
-                Reports
+                <T>Reports</T>
               </span>
             </div>
             <div className="p-4 rounded-2xl bg-white dark:bg-gray-900 border border-[#E5E5E5] dark:border-gray-700 flex flex-col items-center justify-center text-center shadow-sm">
@@ -283,14 +285,14 @@ export default function ImpactDashboard({
                 {liveResolvedCount}
               </span>
               <span className="text-[10px] uppercase tracking-widest font-bold text-[#717171] dark:text-gray-400">
-                Resolved
+                <T>Resolved</T>
               </span>
             </div>
           </div>
 
           <div>
             <h4 className="text-[10px] font-bold text-gray-500 dark:text-gray-400 uppercase tracking-widest mb-3 flex items-center gap-1.5">
-              Badges
+              <T>Badges</T>
               <span className="normal-case tracking-normal text-gray-400">
                 {BADGES.filter((b) => b.earned(badgeStats)).length}/
                 {BADGES.length}
@@ -339,7 +341,7 @@ export default function ImpactDashboard({
             {isGeneratingStory ? (
               <span className="flex items-center gap-2">
                 <img src="/civic-logo.svg" className="w-4 h-4 animate-pulse brightness-0 invert" alt="Loading" />
-                Generating...
+                <T>Generating...</T>
               </span>
             ) : (
               "Generate My Impact Story"
@@ -358,7 +360,7 @@ export default function ImpactDashboard({
                 "{impactStory.story}"
               </p>
               <button className="mt-3 text-[10px] uppercase tracking-widest font-bold text-amber-700 dark:text-amber-500 hover:text-amber-900 dark:hover:text-amber-400 transition-colors flex items-center gap-1">
-                Share <span className="text-sm">→</span>
+                <T>Share</T> <span className="text-sm">→</span>
               </button>
             </div>
           )}
@@ -368,11 +370,11 @@ export default function ImpactDashboard({
       <div className="md:col-span-2 glass-card rounded-3xl p-6 mt-2">
         <div className="flex justify-between items-center mb-6">
           <h3 className="text-xs font-bold text-[#717171] dark:text-gray-400 uppercase tracking-widest">
-            Community Leaderboard
+            <T>Community Leaderboard</T>
           </h3>
           <div className="flex gap-2">
             <span className="px-3 py-1 bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300 rounded-full text-[10px] font-bold uppercase tracking-widest cursor-pointer hover:bg-gray-200 dark:hover:bg-gray-700">
-              Global
+              <T>Global</T>
             </span>
             {currentProfile?.ward && (
               <span className="px-3 py-1 border border-gray-200 dark:border-gray-700 text-gray-500 dark:text-gray-400 rounded-full text-[10px] font-bold uppercase tracking-widest cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800">
@@ -384,18 +386,18 @@ export default function ImpactDashboard({
 
         {leaderboard.length === 0 ? (
           <div className="text-center py-12 text-gray-400 dark:text-gray-500 text-sm">
-            No reports yet — be the first to put your ward on the board.
+            <T>No reports yet — be the first to put your ward on the board.</T>
           </div>
         ) : (
           <div className="overflow-x-auto">
             <table className="w-full text-left text-sm text-[#4A4A4A] dark:text-gray-300">
               <thead>
                 <tr className="border-b border-[#E5E5E5] dark:border-gray-800 text-[10px] text-gray-400 uppercase font-bold tracking-wider">
-                  <th className="pb-3 px-2 font-medium">Rank</th>
-                  <th className="pb-3 px-2 font-medium">Citizen</th>
-                  <th className="pb-3 px-2 font-medium">Ward</th>
-                  <th className="pb-3 px-2 font-medium text-center">Reports</th>
-                  <th className="pb-3 px-2 font-medium text-right">Points</th>
+                  <th className="pb-3 px-2 font-medium"><T>Rank</T></th>
+                  <th className="pb-3 px-2 font-medium"><T>Citizen</T></th>
+                  <th className="pb-3 px-2 font-medium"><T>Ward</T></th>
+                  <th className="pb-3 px-2 font-medium text-center"><T>Reports</T></th>
+                  <th className="pb-3 px-2 font-medium text-right"><T>Points</T></th>
                 </tr>
               </thead>
               <tbody>

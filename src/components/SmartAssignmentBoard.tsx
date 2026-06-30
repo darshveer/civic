@@ -4,9 +4,13 @@
  */
 
 import React, { useState, useEffect } from "react";
+import { T } from "../lib/translate";
 import { CivicIssue, CivicStatus, CivicCategory, UserScope } from "../types";
 import type { User } from "firebase/auth";
 import { db, corroborateAndApprove } from "../lib/firebase";
+import { downloadResolutionPdf } from "../lib/resolutionPdf";
+import ResolveProofModal from "./ResolveProofModal";
+import { aiLanguageName } from "../i18n";
 import { canActOnIssue, statusOptions, statusLabel } from "../lib/roles";
 import { doc, updateDoc } from "firebase/firestore";
 import {
@@ -18,6 +22,9 @@ import {
   Send,
   Loader2,
   Check,
+  Phone,
+  Download,
+  ImageOff,
 } from "lucide-react";
 
 interface KanbanProps {
@@ -42,6 +49,8 @@ const COLUMNS: { key: string; label: string; statuses: CivicStatus[] }[] = [
       // Trust Engine: fresh trust-track reports + suspected fraud await review.
       "Pending Verification",
       "Flagged for Review",
+      // Citizen re-opened a resolved issue — needs another look here.
+      "Escalated",
       // Legacy/edge: pre-auto-route submissions still surface here.
       "Reported",
     ],
@@ -118,8 +127,27 @@ export default function SmartAssignmentBoard({
     });
   };
 
+  // Proof-gated resolution: moving a card to "Resolved" (drag-drop OR the status
+  // dropdown) opens a popup that requires an after-photo + AI verification.
+  const [resolveModalIssue, setResolveModalIssue] = useState<CivicIssue | null>(null);
+  const [resolveMsg, setResolveMsg] = useState<string | null>(null);
+
+  const requestResolution = (issue: CivicIssue) => {
+    if (!canActOnIssue(scope, issue)) {
+      setResolveMsg("You are not authorised to resolve issues in this area.");
+      setTimeout(() => setResolveMsg(null), 3500);
+      return;
+    }
+    setResolveModalIssue(issue);
+  };
+
   const setStatus = async (issue: CivicIssue, status: CivicStatus) => {
     if (issue.status === status) return;
+    // Resolution must go through photographic proof + AI verification.
+    if (status === "Resolved") {
+      requestResolution(issue);
+      return;
+    }
     try {
       await updateDoc(doc(db, "issues", issue.id), { status });
     } catch (err) {
@@ -170,7 +198,7 @@ export default function SmartAssignmentBoard({
       const res = await fetch("/api/draft-dispatch", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ issue }),
+        body: JSON.stringify({ issue, language: aiLanguageName() }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Draft failed.");
@@ -228,7 +256,19 @@ export default function SmartAssignmentBoard({
 
   const matchesCategory = (i: CivicIssue) =>
     categoryFilter === "All" || i.category === categoryFilter;
-  const visibleIssues = issues.filter(matchesCategory);
+
+  // The board is a live work-queue, not an archive: drop issues resolved more
+  // than 7 days ago from the Resolved column. They remain in the full archive.
+  const RESOLVED_BOARD_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+  const isRecentlyResolved = (i: CivicIssue) => {
+    if (i.status !== "Resolved") return true;
+    const when = i.resolvedAt || i.reportedAt || 0;
+    return Date.now() - when <= RESOLVED_BOARD_WINDOW_MS;
+  };
+
+  const visibleIssues = issues.filter(
+    (i) => matchesCategory(i) && isRecentlyResolved(i),
+  );
   const pinnedIssues = visibleIssues.filter((i) => pinned.has(i.id));
 
   const Card = (issue: CivicIssue) => {
@@ -245,14 +285,16 @@ export default function SmartAssignmentBoard({
         style={{ borderLeftColor: priorityColor(issue.priorityTier) }}
       >
         <div className="flex items-start gap-2.5">
-          <div className="w-11 h-11 rounded-lg overflow-hidden shrink-0 bg-gray-100 dark:bg-gray-800 border border-gray-200 dark:border-gray-700">
+          <div className="w-11 h-11 rounded-lg overflow-hidden shrink-0 bg-gray-100 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 flex items-center justify-center">
             {issue.imageUrl ? (
               <img
                 src={issue.imageUrl}
                 alt=""
                 className="w-full h-full object-cover"
               />
-            ) : null}
+            ) : (
+              <ImageOff className="w-4 h-4 text-gray-300 dark:text-gray-600" />
+            )}
           </div>
           <div className="min-w-0 flex-1">
             <p className="font-bold text-xs text-gray-900 dark:text-white truncate">
@@ -299,7 +341,7 @@ export default function SmartAssignmentBoard({
           className="mt-2.5 border-t border-gray-100 dark:border-gray-700 pt-2.5"
           onClick={(e) => e.stopPropagation()}
         >
-          <label className="sr-only">Move to status</label>
+          <label className="sr-only"><T>Move to status</T></label>
           <select
             value={issue.status}
             onChange={(e) => setStatus(issue, e.target.value as CivicStatus)}
@@ -318,6 +360,20 @@ export default function SmartAssignmentBoard({
 
   return (
     <div className="max-w-7xl mx-auto w-full min-w-0 text-gray-900 dark:text-white">
+      {resolveMsg && (
+        <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-50 max-w-[90vw] bg-gray-900 text-white text-xs font-semibold px-4 py-2.5 rounded-full shadow-lg">
+          {resolveMsg}
+        </div>
+      )}
+
+      {/* Proof-gated resolution popup (prompt → verifying → result). */}
+      {resolveModalIssue && (
+        <ResolveProofModal
+          issue={resolveModalIssue}
+          currentUser={currentUser}
+          onClose={() => setResolveModalIssue(null)}
+        />
+      )}
       <div className="mb-4">
         <h2 className="text-2xl sm:text-3xl font-display font-bold tracking-tight flex items-center gap-2">
           <LayoutDashboard className="w-7 h-7 shrink-0" />
@@ -400,7 +456,7 @@ export default function SmartAssignmentBoard({
               <div className="flex-1 overflow-y-auto no-scrollbar space-y-3 max-h-[44vh] sm:max-h-[58vh] pr-0.5">
                 {cards.length === 0 ? (
                   <div className="text-center text-[11px] text-gray-400 dark:text-gray-600 border border-dashed border-gray-300 dark:border-gray-700 rounded-xl py-8">
-                    No issues here
+                    <T>No issues here</T>
                   </div>
                 ) : (
                   cards.map((issue) => Card(issue))
@@ -494,6 +550,17 @@ export default function SmartAssignmentBoard({
                   label="Reported"
                   value={new Date(liveDetail.reportedAt).toLocaleString()}
                 />
+                {liveDetail.reportedByPhone && (
+                  <div className="col-span-2">
+                    <p className="text-[10px] font-bold uppercase tracking-wider text-gray-400 mb-0.5"><T>Contact</T></p>
+                    <a
+                      href={`tel:${liveDetail.reportedByPhone}`}
+                      className="text-xs font-bold text-blue-600 dark:text-blue-400 inline-flex items-center gap-1 hover:underline"
+                    >
+                      <Phone className="w-3.5 h-3.5" /> {liveDetail.reportedByPhone}
+                    </a>
+                  </div>
+                )}
                 <Detail
                   label="Location"
                   value={
@@ -571,7 +638,7 @@ export default function SmartAssignmentBoard({
                       <div className="space-y-2.5 animate-in fade-in duration-200">
                         <div>
                           <label className="block text-[9px] font-bold text-gray-400 uppercase tracking-wider mb-1">
-                            To (department inbox)
+                            <T>To (department inbox)</T>
                           </label>
                           <input
                             type="email"
@@ -627,7 +694,7 @@ export default function SmartAssignmentBoard({
                             disabled={sending}
                             className="px-4 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 text-gray-700 dark:text-gray-300 font-bold text-xs uppercase tracking-widest py-2.5 rounded-xl hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors cursor-pointer"
                           >
-                            Cancel
+                            <T>Cancel</T>
                           </button>
                         </div>
                       </div>
@@ -643,7 +710,7 @@ export default function SmartAssignmentBoard({
               {/* Quick status change from the detail view */}
               <div className="pt-1">
                 <label className="block text-[10px] font-bold text-gray-500 dark:text-gray-400 uppercase tracking-wider mb-1">
-                  Update status
+                  <T>Update status</T>
                 </label>
                 <select
                   value={liveDetail.status}
@@ -659,6 +726,17 @@ export default function SmartAssignmentBoard({
                   ))}
                 </select>
               </div>
+
+              {(liveDetail.status === "Resolved" ||
+                (liveDetail.escalationHistory?.length || 0) > 0) &&
+                canActOnIssue(scope, liveDetail) && (
+                  <button
+                    onClick={() => downloadResolutionPdf(liveDetail)}
+                    className="w-full mt-2 py-2.5 rounded-xl border border-primary/40 bg-primary/5 text-primary text-[11px] font-bold uppercase tracking-wider flex items-center justify-center gap-2 hover:bg-primary/10 transition-colors cursor-pointer"
+                  >
+                    <Download className="w-4 h-4" /> Download report (PDF)
+                  </button>
+                )}
             </div>
           </div>
         </div>

@@ -141,6 +141,8 @@ export async function resolveIssue(
     resolvedImageUrl: string;
     resolutionConfidence: number;
     resolutionNotes: string;
+    // Optional recompressed "before" image, written to keep the doc < 1 MB.
+    beforeImageUrl?: string;
   },
 ): Promise<boolean> {
   const issueRef = doc(db, "issues", issueId);
@@ -156,6 +158,7 @@ export async function resolveIssue(
       resolutionNotes: resolution.resolutionNotes,
       resolvedAt: Date.now(),
       resolvedByUid: resolverUid,
+      ...(resolution.beforeImageUrl ? { imageUrl: resolution.beforeImageUrl } : {}),
     });
     return true;
   });
@@ -196,6 +199,60 @@ export async function corroborateAndApprove(
     });
     return true;
   });
+}
+
+/**
+ * Re-escalation (citizen-driven). The report owner re-opens a Resolved issue
+ * they're unhappy with. The current resolution is archived into
+ * escalationHistory (so the PDF can show previous-vs-new fixes); status flips to
+ * "Escalated". First escalation re-opens to the SAME tier; each subsequent one
+ * bumps escalationLevel up a tier (field→zonal→city, capped at city).
+ * Transactional + idempotent. Returns true if this call escalated it.
+ */
+export async function escalateIssue(
+  issueId: string,
+  citizenUid: string,
+  reason: string,
+): Promise<boolean> {
+  const issueRef = doc(db, "issues", issueId);
+  return runTransaction(db, async (tx) => {
+    const snap = await tx.get(issueRef);
+    if (!snap.exists()) throw new Error("Issue no longer exists.");
+    const data = snap.data() as CivicIssue;
+    if (data.reportedByUid !== citizenUid)
+      throw new Error("Only the original reporter can escalate this report.");
+    if (data.status !== "Resolved")
+      throw new Error("Only a resolved report can be escalated.");
+
+    const count = (data.escalationCount || 0) + 1;
+    // First re-open stays at the resolving tier; later ones move up.
+    const level =
+      count <= 1
+        ? data.escalationLevel || 0
+        : Math.min(2, (data.escalationLevel || 0) + 1);
+    const record = {
+      at: Date.now(),
+      byUid: citizenUid,
+      reason: reason || "",
+      previousResolvedImageUrl: data.resolvedImageUrl || "",
+      previousResolvedByUid: data.resolvedByUid || "",
+      previousResolvedAt: data.resolvedAt || 0,
+      previousNotes: data.resolutionNotes || "",
+    };
+    tx.update(issueRef, {
+      status: "Escalated",
+      escalationLevel: level,
+      escalationCount: count,
+      escalationReason: reason || "",
+      escalationHistory: [...(data.escalationHistory || []), record],
+    });
+    return true;
+  });
+}
+
+/** Saves/updates the signed-in citizen's contact number on their profile. */
+export async function setCitizenPhone(uid: string, phone: string): Promise<void> {
+  await setDoc(doc(db, "citizens", uid), { phone }, { merge: true });
 }
 
 /**

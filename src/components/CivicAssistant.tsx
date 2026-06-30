@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from "react";
+import { T } from "../lib/translate";
 import {
   MessageSquare,
   X,
@@ -24,11 +25,12 @@ import {
   Pin,
   useMap,
 } from "@vis.gl/react-google-maps";
-import { db } from "../lib/firebase";
+import { db, setCitizenPhone } from "../lib/firebase";
 import { loadWardsConfig, zoneForWard } from "../lib/roles";
 import { resolveZoneAuthoritative } from "../lib/cityZones";
 import { wardZoneAtPoint } from "../lib/wardLookup";
-import { CivicCategory, CivicIssue, CivicStatus } from "../types";
+import { CivicCategory, CivicIssue, CivicStatus, CitizenProfile } from "../types";
+import { aiLanguageName } from "../i18n";
 import { homeCoords, haversineMeters } from "../lib/civic";
 import { searchPlaces, reverseGeocode, GeoResult } from "../lib/geocode";
 
@@ -191,7 +193,7 @@ function ChatLocationPicker(props: {
   if (!MAPS_KEY) {
     return (
       <p className="text-[10px] text-gray-500 dark:text-gray-400">
-        Map unavailable (no Maps key) — the report uses your current location.
+        <T>Map unavailable (no Maps key) — the report uses your current location.</T>
       </p>
     );
   }
@@ -416,6 +418,7 @@ const DEPARTMENT_BY_CATEGORY: Record<string, string> = {
 
 interface CivicAssistantProps {
   currentUser: FirebaseUser | null;
+  profile?: CitizenProfile | null;
   issues: CivicIssue[];
 }
 
@@ -435,6 +438,7 @@ const LANGUAGES = [
 
 export default function CivicAssistant({
   currentUser,
+  profile,
   issues,
 }: CivicAssistantProps) {
   const [isOpen, setIsOpen] = useState(false);
@@ -461,9 +465,24 @@ export default function CivicAssistant({
   ]);
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
-  const [language, setLanguage] = useState("English");
+  const [language, setLanguage] = useState(aiLanguageName());
   const [isLangMenuOpen, setIsLangMenuOpen] = useState(false);
   const [reportFlow, setReportFlow] = useState<ReportFlow>(null);
+  // AI-chat mobile-number capture: prompts when the profile has no number yet.
+  const [localPhone, setLocalPhone] = useState<string>(profile?.phone || "");
+  const [savingPhone, setSavingPhone] = useState(false);
+  const hasPhone = Boolean(profile?.phone || localPhone);
+  const saveChatPhone = async () => {
+    if (!currentUser || !/^[+]?[0-9][0-9 ()-]{6,14}$/.test(localPhone.trim())) return;
+    setSavingPhone(true);
+    try {
+      await setCitizenPhone(currentUser.uid, localPhone.trim());
+    } catch (e) {
+      console.error("Could not save phone:", e);
+    } finally {
+      setSavingPhone(false);
+    }
+  };
   const [submitting, setSubmitting] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
   const [cameraOn, setCameraOn] = useState(false);
@@ -820,6 +839,8 @@ export default function CivicAssistant({
         zone,
         reportedByUid: currentUser.uid,
         reportedByName: currentUser.displayName || "Civic Hero",
+        reportedByPhone: profile?.phone || localPhone.trim() || "",
+        source: "citizen-photo",
         reportedAt: Date.now(),
         status: f.status,
         upvotesCount: 0,
@@ -894,8 +915,8 @@ export default function CivicAssistant({
               <Bot className="w-5 h-5" />
             </div>
             <div>
-              <h3 className="font-bold text-sm">Civic Assistant</h3>
-              <p className="text-[10px] opacity-80">AI-Powered Support</p>
+              <h3 className="font-bold text-sm"><T>Civic Assistant</T></h3>
+              <p className="text-[10px] opacity-80"><T>AI-Powered Support</T></p>
             </div>
           </div>
           <div className="flex items-center gap-2 relative">
@@ -1022,6 +1043,35 @@ export default function CivicAssistant({
           }}
         />
 
+        {/* AI-chat mobile-number capture (only when the profile lacks one) */}
+        {reportFlow?.stage === "photo" && !hasPhone && (
+          <div className="mx-3 mb-2 mt-1 rounded-2xl border border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-900/20 p-3 shrink-0">
+            <p className="text-[10px] font-bold uppercase tracking-widest text-amber-700 dark:text-amber-400 mb-1.5">
+              <T>Add your mobile number</T>
+            </p>
+            <p className="text-[11px] text-gray-600 dark:text-gray-300 mb-2">
+              <T>So municipal staff can call you back about this issue.</T>
+            </p>
+            <div className="flex gap-2">
+              <input
+                type="tel"
+                inputMode="tel"
+                value={localPhone}
+                onChange={(e) => setLocalPhone(e.target.value)}
+                placeholder="Mobile number"
+                className="flex-1 min-w-0 text-xs px-3 py-2 rounded-full bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 text-gray-900 dark:text-white outline-none focus:border-primary"
+              />
+              <button
+                onClick={saveChatPhone}
+                disabled={savingPhone || !/^[+]?[0-9][0-9 ()-]{6,14}$/.test(localPhone.trim())}
+                className="shrink-0 bg-primary hover:bg-primary/90 text-white text-[11px] font-bold uppercase tracking-wider px-3 py-2 rounded-full transition-colors cursor-pointer disabled:opacity-50"
+              >
+                {savingPhone ? "Saving…" : "Save"}
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Guided reporting flow */}
         {reportFlow?.stage === "photo" && (
           <div className="mx-3 mb-2 mt-1 rounded-2xl border border-primary/30 bg-primary/5 dark:bg-primary/10 p-3 shrink-0 animate-in slide-in-from-bottom-2 duration-200">
@@ -1051,7 +1101,7 @@ export default function CivicAssistant({
                     onClick={stopCamera}
                     className="px-4 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-gray-700 dark:text-gray-300 text-[11px] font-bold uppercase tracking-wider py-2 rounded-full hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors cursor-pointer"
                   >
-                    Cancel
+                    <T>Cancel</T>
                   </button>
                 </div>
               </div>
@@ -1143,7 +1193,7 @@ export default function CivicAssistant({
             )}
 
             <label className="block text-[10px] font-bold text-gray-500 dark:text-gray-400 uppercase tracking-wider mt-2.5 mb-1">
-              Description (editable)
+              <T>Description (editable)</T>
             </label>
             <textarea
               value={reportFlow.description}
@@ -1155,7 +1205,7 @@ export default function CivicAssistant({
 
             <div className="flex items-center justify-between mt-2 mb-1">
               <label className="text-[10px] font-bold text-gray-500 dark:text-gray-400 uppercase tracking-wider">
-                Location
+                <T>Location</T>
               </label>
               <button
                 onClick={() => setShowMap((v) => !v)}
@@ -1226,7 +1276,7 @@ export default function CivicAssistant({
                 title="Use a different photo"
                 className="px-3 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-gray-700 dark:text-gray-300 text-[11px] font-bold uppercase tracking-wider py-2 rounded-full hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors disabled:opacity-60 cursor-pointer"
               >
-                Retake
+                <T>Retake</T>
               </button>
               <button
                 onClick={() => {
@@ -1236,7 +1286,7 @@ export default function CivicAssistant({
                 disabled={submitting}
                 className="px-3 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-gray-700 dark:text-gray-300 text-[11px] font-bold uppercase tracking-wider py-2 rounded-full hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors disabled:opacity-60 cursor-pointer"
               >
-                Cancel
+                <T>Cancel</T>
               </button>
             </div>
           </div>

@@ -1,6 +1,6 @@
 # C.I.V.I.C - Community Infrastructure Verification & Intelligent Clustering
 
-A modern, gamified civic engagement platform that connects citizens directly with city administration — built around a **fleet of 12 Gemini agents** (backed by **3 deterministic decision engines**) that triage, verify, deduplicate, prioritise, predict, dispatch, and advocate. Two are **tool-using / function-calling** agents: a citizen can file a report just by chatting, and staff can query live city data in plain language; a work-order can also be drafted and dispatched in one click.
+A modern, gamified civic engagement platform that connects citizens directly with city administration — built around a **fleet of 14 Gemini agents** (backed by **3 deterministic decision engines**) that triage, verify, deduplicate, prioritise, predict, dispatch, and advocate. Two are **tool-using / function-calling** agents: a citizen can file a report just by chatting, and staff can query live city data in plain language; a work-order can also be drafted and dispatched in one click. Citizens can report with a photo, by voice, or **description-only** (no photo); staff can file complaints that arrive as **scanned letters, emails, or phone calls**; every resolution produces a **downloadable PDF report**; dissatisfied citizens can **re-escalate**; and the whole UI is available in **English, Hindi and Kannada**.
 
 ## Features
 
@@ -20,15 +20,22 @@ A modern, gamified civic engagement platform that connects citizens directly wit
 - **Gamification**: Earn civic points, climb the global and ward leaderboards, unlock badges, complete **missions**, and get personalised nudges from the **Missions Coach agent**. Points and report counts are **derived live from the issues collection** — a single source of truth, so they never drift after a delete or purge. A shareable AI-generated **Impact Story** card celebrates each citizen's contribution.
 - **Neighborhood Alerts**: Citizens see a live summary of issues clustered around their home ward/coordinates.
 - **Real-Time Updates**: Get in-app notifications when the status of your reported issues changes.
-- **Community Interaction**: Upvote, corroborate, and comment on local issues, with **offline rule-based profanity moderation** (mask common profanity, block severe slurs, leetspeak-aware). Municipal staff cannot upvote, and nobody can upvote their own report.
+- **Community Interaction**: Upvote, corroborate, and comment on local issues, with **offline rule-based profanity moderation** (mask common profanity, block severe slurs, leetspeak-aware). Municipal staff cannot upvote, and nobody can upvote their own report. **Comments can be removed** by their author or by staff (staff must give a justification) — a soft-delete tombstone keeps an accountability trail.
 - **Municipal Hierarchy (RBAC)**: Three staff tiers modelled on Indian urban local bodies — **Ward Officer (field)** → **Zonal Supervisor** → **City Administrator** — each scoped to the area they govern. Staff views, the cascading **State → City → Zone → Ward** filter, and all status/delete/purge actions are bounded by the signed-in officer's scope and enforced server-side by Firestore rules.
-- **Before / After Resolution**: Staff upload an "after" photo; the **Resolution-Verification agent** confirms the fix before the status flips to Resolved (once, via a transaction — no double-awards), and citizens see a before/after comparison.
+- **Mobile number capture**: Citizens provide a mobile number at sign-up (and via the AI chat assistant if missing); staff see a one-tap **call** link on every report for that citizen.
+- **Description-only reporting**: No photo needed — citizens can file with just a description + location. The **Text-Triage agent** rejects gibberish and triages genuine text (these start as "Pending Verification", skipping image forensics).
+- **Complaint intake (letters / emails / calls)**: Staff have a **Create Complaint** button — upload a scanned letter PDF/image or paste an email and the **Complaint-Intake agent** extracts a structured complaint; phone-call complaints can be entered manually.
+- **Proof-gated resolution everywhere**: Resolving on the Kanban board (drag-drop or dropdown) now requires an after-photo + AI verification, exactly like the map flow — no silent resolves. Resolution/escalation photos are downscaled client-side to stay within Firestore limits.
+- **Downloadable PDF resolution reports**: Every resolved issue produces an in-browser **PDF** (before/after images, who resolved it, time-to-resolve, AI confidence, escalation history), downloadable by the citizen and by in-scope staff (field → ward, zonal → zone, city → all).
+- **Citizen re-escalation**: Unhappy with a fix? The reporter can **re-open** a resolved issue — it returns to the same tier first, then escalates one tier up (field → zonal → city). The PDF captures previous-vs-new resolution photos.
+- **Multi-language UI (credit-free)**: Full interface in **English, Hindi and Kannada** with a header switcher. UI strings are translated **once, offline, into bundled static dictionaries** (generated by `npm run i18n` via a free, keyless machine-translation endpoint) — so the running app does **zero LLM calls** for translation. Any dynamic/stored text falls back to the same free endpoint, cached. AI **agents generate their output directly in the selected language**.
+- **Before / After Resolution**: Staff upload an "after" photo; the **Resolution-Verification agent** confirms the fix before the status flips to Resolved (once, via a transaction — no double-awards), and citizens see a before/after comparison. The after-photo is also run through the **Cognitive Forensics agent** — a manipulated/inauthentic image is rejected, so fake photos can't close an issue. Resolution is **proof-gated everywhere** (map, Kanban drag-and-drop, and the archive status dropdown), and the Kanban "Resolved" column only keeps issues resolved in the last 7 days (older ones live in the archive).
 - **Email OTP Verification**: Email/password sign-ups verify via a one-time code over SMTP (in-memory, short TTL — no firebase-admin required).
 - **Resilient Model Cascade**: Every agent falls through a **5-tier cascade — primary Gemini → lightweight Gemini → z.ai → OpenRouter → Groq** (text agents) — then a static fallback, with a **15-minute circuit breaker** that skips Gemini after a quota (429) error. Vision agents always use Gemini; everything **fails open**, so an AI outage never breaks a citizen submission.
 
 ## AI Agent Fleet
 
-CIVIC ships **12 Gemini-powered agents** wired into live features, plus **3 deterministic decision engines** in the report pipeline. Two agents are genuinely **tool-using** (multi-step / function-calling).
+CIVIC ships **14 Gemini-powered agents** wired into live features, plus **3 deterministic decision engines** in the report pipeline. Two agents are genuinely **tool-using** (multi-step / function-calling).
 
 | # | Gemini agent | Trigger | What it does |
 |---|-------|---------|--------------|
@@ -44,6 +51,8 @@ CIVIC ships **12 Gemini-powered agents** wired into live features, plus **3 dete
 | 10 | **Civic Advocacy / Petition** | High-support issue | Drafts a formal petition to the right department |
 | 11 | **Auto-Dispatch** | Staff issue detail | Drafts a department work-order email for one-click staff approval & send |
 | 12 | **Missions Coach** | Citizen dashboard | Personalised motivating nudge toward the next rank |
+| 13 | **Text-Triage** | Description-only report | Gibberish/quality gate, then category/severity/department from text alone (no photo) |
+| 14 | **Complaint-Intake Extraction** | Staff "Create Complaint" | Extracts a structured complaint from a scanned letter PDF/image or a pasted email |
 
 🛠️ = tool-using / function-calling agent (multi-step, takes or proposes an action).
 
@@ -59,7 +68,7 @@ CIVIC ships **12 Gemini-powered agents** wired into live features, plus **3 dete
 
 ## Tech Stack
 
-- **Frontend**: React + Vite, Tailwind CSS
+- **Frontend**: React + Vite, Tailwind CSS, react-i18next + bundled static translation dictionaries (English / Hindi / Kannada, generated free via `npm run i18n` — no LLM credits), pdf-lib (in-browser resolution-report PDFs)
 - **Mapping**: Google Maps Platform (Advanced Markers, Geocoding, Places API)
 - **Backend**: Express server (Vite middleware in dev, static in prod) — uses the Firebase **client** SDK server-side, **no firebase-admin**, so it deploys cleanly on Google AI Studio / Cloud Run.
 - **Database**: Firebase Firestore (Real-time NoSQL), secured entirely by `firestore.rules`.

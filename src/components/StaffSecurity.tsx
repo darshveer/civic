@@ -4,6 +4,7 @@
  */
 
 import React, { useEffect, useState } from "react";
+import { T } from "../lib/translate";
 import { updatePassword, type User } from "firebase/auth";
 import { doc, getDoc, setDoc, deleteDoc } from "firebase/firestore";
 import { QRCodeSVG } from "qrcode.react";
@@ -99,10 +100,10 @@ export function ForcePasswordChange({
             <KeyRound className="w-6 h-6" />
           </div>
           <h2 className="text-lg font-bold text-gray-900 dark:text-white">
-            Set your password
+            <T>Set your password</T>
           </h2>
           <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
-            This is your first sign-in — please replace the temporary password.
+            <T>This is your first sign-in — please replace the temporary password.</T>
           </p>
         </div>
         <input
@@ -134,7 +135,7 @@ export function ForcePasswordChange({
           onClick={onCancel}
           className="block mx-auto text-xs text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white font-semibold"
         >
-          Sign out instead
+          <T>Sign out instead</T>
         </button>
       </div>
     </div>
@@ -184,10 +185,10 @@ export function TwoFactorChallenge({
         </div>
         <div>
           <h2 className="text-lg font-bold text-gray-900 dark:text-white">
-            Two-factor authentication
+            <T>Two-factor authentication</T>
           </h2>
           <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
-            Enter the 6-digit code from your authenticator app to continue.
+            <T>Enter the 6-digit code from your authenticator app to continue.</T>
           </p>
         </div>
         <input
@@ -213,7 +214,7 @@ export function TwoFactorChallenge({
           onClick={onCancel}
           className="text-xs text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white font-semibold"
         >
-          Cancel & sign out
+          <T>Cancel & sign out</T>
         </button>
       </div>
     </div>
@@ -241,10 +242,10 @@ export function TwoFactorSettings({
           </div>
           <div>
             <h3 className="text-sm font-bold text-gray-900 dark:text-white">
-              Two-factor authentication
+              <T>Two-factor authentication</T>
             </h3>
             <p className="text-xs text-emerald-700 dark:text-emerald-400">
-              Enforced for administrators.
+              <T>Enforced for administrators.</T>
             </p>
           </div>
         </div>
@@ -355,7 +356,7 @@ function StaffTwoFactorSettings({ currentUser }: { currentUser: User | null }) {
         </div>
         <div>
           <h3 className="text-sm font-bold text-gray-900 dark:text-white">
-            Two-factor authentication
+            <T>Two-factor authentication</T>
           </h3>
           <p className="text-xs text-gray-500 dark:text-gray-400">
             {enabled === null
@@ -444,7 +445,7 @@ function StaffTwoFactorSettings({ currentUser }: { currentUser: User | null }) {
               disabled={busy}
               className="px-4 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-gray-700 dark:text-gray-300 font-bold text-sm py-2.5 rounded-xl hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors disabled:opacity-60 cursor-pointer"
             >
-              Cancel
+              <T>Cancel</T>
             </button>
           </div>
         </div>

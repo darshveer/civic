@@ -36,7 +36,37 @@ export type CivicStatus =
   | "Pending Verification"
   | "Community Verified"
   | "Staff Verified"
-  | "Flagged for Review";
+  | "Flagged for Review"
+  // --- Re-escalation: citizen re-opened a resolved issue ---
+  | "Escalated";
+
+/**
+ * How a report entered the system.
+ *  - "citizen-photo" → standard photo report (default for legacy data).
+ *  - "citizen-text"  → description-only report (no image).
+ *  - "staff-letter" / "staff-email" / "staff-phone" → complaint filed by a
+ *    staff member on a citizen's behalf (scanned letter, pasted email, call).
+ */
+export type ReportSource =
+  | "citizen-photo"
+  | "citizen-text"
+  | "staff-letter"
+  | "staff-email"
+  | "staff-phone";
+
+/**
+ * One archived resolution, kept when a citizen re-escalates so the PDF report
+ * can show previous-vs-new fix images.
+ */
+export interface EscalationRecord {
+  at: number;
+  byUid: string;
+  reason?: string;
+  previousResolvedImageUrl?: string;
+  previousResolvedByUid?: string;
+  previousResolvedAt?: number;
+  previousNotes?: string;
+}
 
 /**
  * How the citizen telemetry (Layer 1) sourced the map-pin coordinates.
@@ -69,6 +99,13 @@ export interface IssueComment {
   authorName: string;
   text: string;
   createdAt: number;
+  // Soft-deletion audit trail: a removed comment is kept (as a tombstone) with
+  // who removed it and why — by the author, or by a staff member (justified).
+  deleted?: boolean;
+  deletedByUid?: string;
+  deletedByName?: string;
+  deletedReason?: string;
+  deletedAt?: number;
 }
 
 /**
@@ -102,7 +139,10 @@ export interface CivicIssue {
   zone?: string;
   reportedByUid: string;
   reportedByName: string;
+  reportedByPhone?: string; // denormalized so staff can call without reading citizens
   reportedAt: number; // Timestamp
+  source?: ReportSource; // how the report entered (default: citizen-photo)
+  filedByStaffUid?: string; // staff uid when a complaint is filed on someone's behalf
   status: CivicStatus;
   upvotesCount: number;
   upvotedBy?: string[];
@@ -138,6 +178,10 @@ export interface CivicIssue {
   resolvedByUid?: string;
   resolutionConfidence?: number;
   resolutionNotes?: string;
+  // --- Re-escalation (citizen-driven) ---
+  escalationCount?: number; // how many times the citizen has re-opened it
+  escalationReason?: string; // latest dissatisfaction note
+  escalationHistory?: EscalationRecord[]; // archived prior resolutions
 }
 
 /**
@@ -197,6 +241,7 @@ export interface CitizenProfile {
   role?: "citizen" | "staff";
   badges?: string[];
   ward?: string;
+  phone?: string; // contact number for staff call-backs
 }
 
 /**

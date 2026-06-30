@@ -16,13 +16,22 @@ import {
   FileText,
   PenLine,
   ShieldCheck,
+  Phone,
+  ImageOff,
+  Trash2,
 } from "lucide-react";
-import { db, toggleUpvote, resolveIssue, corroborateAndApprove } from "../lib/firebase";
+import { db, toggleUpvote, corroborateAndApprove } from "../lib/firebase";
+import ResolveProofModal from "./ResolveProofModal";
 import { doc, updateDoc, arrayUnion } from "firebase/firestore";
 import type { User } from "firebase/auth";
-import { CivicIssue, UserScope } from "../types";
-import { canActOnIssue } from "../lib/roles";
+import { CivicIssue, UserScope, IssueComment } from "../types";
+import { canActOnIssue, escalationTierLabel, canViewReport } from "../lib/roles";
+import { escalateIssue } from "../lib/firebase";
+import { downloadResolutionPdf } from "../lib/resolutionPdf";
 import { zoneCenter, wardsCenter } from "../lib/wardLookup";
+import { aiLanguageName } from "../i18n";
+import { useTranslated, T } from "../lib/translate";
+import { useTranslation } from "react-i18next";
 import { moderateComment } from "../lib/profanity";
 import { petitionEligible, PETITION_THRESHOLD } from "../lib/civic";
 import {
@@ -102,10 +111,49 @@ function PlacesContext({ location }: { location: { lat: number; lng: number } })
   );
 }
 
-function CommentsSection({ selectedIssue, currentUser }: { selectedIssue: CivicIssue, currentUser: User | null }) {
+function CommentsSection({ selectedIssue, currentUser, isStaff }: { selectedIssue: CivicIssue, currentUser: User | null, isStaff: boolean }) {
+  const { t } = useTranslation();
   const [newComment, setNewComment] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  // Comment deletion (author or staff) with a justification popup.
+  const [deleteTarget, setDeleteTarget] = useState<IssueComment | null>(null);
+  const [deleteReason, setDeleteReason] = useState("");
+  const [deleting, setDeleting] = useState(false);
+
+  const confirmDeleteComment = async () => {
+    if (!deleteTarget || !currentUser) return;
+    const isAuthor = deleteTarget.authorUid === currentUser.uid;
+    // Staff (or anyone removing someone else's comment) must justify it.
+    if (!isAuthor && deleteReason.trim().length < 4) return;
+    setDeleting(true);
+    try {
+      const issueRef = doc(db, "issues", selectedIssue.id);
+      // Rewrite the comments array, replacing the target with a tombstone that
+      // records who removed it and why (kept for accountability).
+      const next = (selectedIssue.comments || []).map((c) =>
+        c.id === deleteTarget.id
+          ? {
+              ...c,
+              text: "",
+              deleted: true,
+              deletedByUid: currentUser.uid,
+              deletedByName: currentUser.displayName || (isStaff ? "Municipal staff" : "User"),
+              deletedReason: deleteReason.trim(),
+              deletedAt: Date.now(),
+            }
+          : c,
+      );
+      await updateDoc(issueRef, { comments: next });
+      setDeleteTarget(null);
+      setDeleteReason("");
+    } catch (err) {
+      console.error("Failed to delete comment:", err);
+      setErrorMsg("Couldn't remove the comment.");
+    } finally {
+      setDeleting(false);
+    }
+  };
 
   const handleAddComment = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -143,7 +191,7 @@ function CommentsSection({ selectedIssue, currentUser }: { selectedIssue: CivicI
     <div className="mt-6 border-t border-gray-100 dark:border-gray-800 pt-6">
       <h4 className="text-xs font-bold text-gray-900 dark:text-white uppercase tracking-widest mb-4 flex items-center gap-2">
         <MessageCircle className="w-4 h-4 text-primary" />
-        Comments ({selectedIssue.comments?.length || 0})
+        {t("comments.title")} ({selectedIssue.comments?.length || 0})
       </h4>
       {errorMsg && (
         <div className="p-3 bg-red-50 text-red-700 dark:bg-red-900/30 dark:text-red-400 text-xs rounded-xl mb-4">
@@ -151,23 +199,88 @@ function CommentsSection({ selectedIssue, currentUser }: { selectedIssue: CivicI
         </div>
       )}
       <div className="space-y-4 mb-4 max-h-48 overflow-y-auto no-scrollbar">
-        {selectedIssue.comments?.map(comment => (
-          <div key={comment.id} className="bg-gray-50 dark:bg-gray-800/50 p-3 rounded-2xl">
-            <div className="flex justify-between items-center mb-1">
-              <span className="text-xs font-bold text-gray-900 dark:text-white">{comment.authorName}</span>
-              <span className="text-[10px] text-gray-500">{new Date(comment.createdAt).toLocaleDateString()}</span>
+        {selectedIssue.comments?.map(comment => {
+          const canDelete =
+            !comment.deleted &&
+            Boolean(currentUser) &&
+            (currentUser?.uid === comment.authorUid || isStaff);
+          return (
+            <div key={comment.id} className="bg-gray-50 dark:bg-gray-800/50 p-3 rounded-2xl">
+              <div className="flex justify-between items-center mb-1 gap-2">
+                <span className="text-xs font-bold text-gray-900 dark:text-white truncate">{comment.authorName}</span>
+                <div className="flex items-center gap-2 shrink-0">
+                  <span className="text-[10px] text-gray-500">{new Date(comment.createdAt).toLocaleDateString()}</span>
+                  {canDelete && (
+                    <button
+                      onClick={() => { setDeleteTarget(comment); setDeleteReason(""); }}
+                      title="Delete comment"
+                      className="text-gray-400 hover:text-red-500 transition-colors cursor-pointer"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
+              </div>
+              {comment.deleted ? (
+                <p className="text-xs italic text-gray-400 dark:text-gray-500">
+                  {t("comments.removed")}{comment.deletedByUid && comment.deletedByUid !== comment.authorUid ? " (staff)" : ""}
+                  {comment.deletedReason ? ` — ${comment.deletedReason}` : "."}
+                </p>
+              ) : (
+                <p className="text-xs text-gray-700 dark:text-gray-300">{comment.text}</p>
+              )}
             </div>
-            <p className="text-xs text-gray-700 dark:text-gray-300">{comment.text}</p>
-          </div>
-        ))}
+          );
+        })}
       </div>
+
+      {/* Justification popup for deleting a comment. */}
+      {deleteTarget && (
+        <div className="fixed inset-0 bg-black/40 backdrop-blur-sm flex items-center justify-center p-4 z-[60]">
+          <div className="bg-white dark:bg-gray-900 rounded-3xl border border-[#E5E5E5] dark:border-gray-800 max-w-sm w-full p-6 space-y-4 shadow-2xl">
+            <h3 className="text-base font-bold text-gray-900 dark:text-white"><T>Remove this comment?</T></h3>
+            <p className="text-xs text-gray-500 dark:text-gray-400 bg-gray-50 dark:bg-gray-800/50 rounded-xl p-2.5 line-clamp-3">
+              "{deleteTarget.text}"
+            </p>
+            <textarea
+              value={deleteReason}
+              onChange={(e) => setDeleteReason(e.target.value)}
+              rows={2}
+              placeholder={
+                deleteTarget.authorUid === currentUser?.uid
+                  ? "Reason (optional)"
+                  : "Reason for removal (required)"
+              }
+              className="w-full text-xs p-3 bg-gray-50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-700 rounded-xl outline-none focus:ring-2 focus:ring-primary text-gray-900 dark:text-white resize-none"
+            />
+            <div className="flex gap-3">
+              <button
+                onClick={() => { setDeleteTarget(null); setDeleteReason(""); }}
+                className="flex-1 py-2.5 rounded-full border border-gray-200 dark:border-gray-700 text-xs font-bold text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors cursor-pointer"
+              >
+                <T>Cancel</T>
+              </button>
+              <button
+                onClick={confirmDeleteComment}
+                disabled={
+                  deleting ||
+                  (deleteTarget.authorUid !== currentUser?.uid && deleteReason.trim().length < 4)
+                }
+                className="flex-1 py-2.5 rounded-full bg-red-600 hover:bg-red-700 text-white text-xs font-bold transition-colors cursor-pointer disabled:opacity-50"
+              >
+                {deleting ? "Removing…" : "Remove"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       {currentUser && (
         <form onSubmit={handleAddComment} className="flex gap-2">
           <input
             type="text"
             value={newComment}
             onChange={e => setNewComment(e.target.value)}
-            placeholder="Add a comment..."
+            placeholder={t("comments.add")}
             className="flex-1 text-xs px-4 py-2.5 bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-full outline-none focus:border-primary text-gray-900 dark:text-white"
           />
           <button
@@ -175,7 +288,7 @@ function CommentsSection({ selectedIssue, currentUser }: { selectedIssue: CivicI
             disabled={isSubmitting || !newComment.trim()}
             className="px-4 bg-primary text-white text-[10px] font-bold uppercase tracking-widest rounded-full hover:bg-primary-dark disabled:opacity-50"
           >
-            Post
+            {t("comments.post")}
           </button>
         </form>
       )}
@@ -206,7 +319,7 @@ function PetitionSection({
       const res = await fetch("/api/draft-petition", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ issue }),
+        body: JSON.stringify({ issue, language: aiLanguageName() }),
       });
       const data = await res.json();
       if (!res.ok || !data.petition) throw new Error(data.error || "Draft failed.");
@@ -485,7 +598,10 @@ export default function CommandMap({
   isDarkMode,
 }: CommandMapProps) {
   const isStaff = scope.role === "staff";
+  const { t } = useTranslation();
   const [selectedIssue, setSelectedIssue] = useState<CivicIssue | null>(null);
+  // Translate stored text (written in another language) to the active UI language.
+  const translatedDescription = useTranslated(selectedIssue?.description);
   const [filterCategory, setFilterCategory] = useState<string>("All");
   const [cityFilter, setCityFilter] = useState<string>("All");
   const [wardFilter, setWardFilter] = useState<string>("All");
@@ -496,14 +612,29 @@ export default function CommandMap({
   const [isImageModalOpen, setIsImageModalOpen] = useState(false);
   const [upvoteError, setUpvoteError] = useState<string | null>(null);
   const [approvingId, setApprovingId] = useState<string | null>(null);
-  const [resolvingIssue, setResolvingIssue] = useState<CivicIssue | null>(null);
-  const [isVerifying, setIsVerifying] = useState(false);
-  const [verificationResult, setVerificationResult] = useState<{
-    isResolved: boolean;
-    confidence: number;
-    notes: string;
-  } | null>(null);
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const [escalateOpen, setEscalateOpen] = useState(false);
+  const [escalateReason, setEscalateReason] = useState("");
+  const [escalating, setEscalating] = useState(false);
+  const [escalateError, setEscalateError] = useState<string | null>(null);
+
+  const submitEscalation = async () => {
+    if (!currentUser || !selectedIssue) return;
+    setEscalating(true);
+    setEscalateError(null);
+    try {
+      await escalateIssue(selectedIssue.id, currentUser.uid, escalateReason.trim());
+      setEscalateOpen(false);
+      setEscalateReason("");
+    } catch (err) {
+      setEscalateError(
+        err instanceof Error ? err.message : "Couldn't escalate this report.",
+      );
+    } finally {
+      setEscalating(false);
+    }
+  };
+  // Proof-gated resolution popup (prompt → verifying → result).
+  const [resolveModalIssue, setResolveModalIssue] = useState<CivicIssue | null>(null);
 
   const viewCenter = { lat: 12.9716, lng: 77.5946 };
   const [center, setCenter] = useState<{ lat: number; lng: number }>(
@@ -563,31 +694,6 @@ export default function CommandMap({
     setSelectedIssue(null);
   };
 
-  const fireConfetti = () => {
-    const end = Date.now() + 1.5 * 1000;
-    const colors = ["#34D399", "#2F6F6A"];
-
-    (function frame() {
-      confetti({
-        particleCount: 3,
-        angle: 60,
-        spread: 55,
-        origin: { x: 0 },
-        colors: colors,
-      });
-      confetti({
-        particleCount: 3,
-        angle: 120,
-        spread: 55,
-        origin: { x: 1 },
-        colors: colors,
-      });
-
-      if (Date.now() < end) {
-        requestAnimationFrame(frame);
-      }
-    })();
-  };
 
   const upvoteIssue = async (issueId: string, e: React.MouseEvent) => {
     e.stopPropagation();
@@ -627,100 +733,11 @@ export default function CommandMap({
     }
   };
 
-  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files[0] && resolvingIssue) {
-      const file = e.target.files[0];
-      // Guard: a staff member must be in scope for this issue, and it must not
-      // already be resolved. (Firestore rules enforce the same.)
-      if (!currentUser || !canActOnIssue(scope, resolvingIssue)) {
-        setVerificationResult({
-          isResolved: false,
-          confidence: 0,
-          notes: "You are not authorised to resolve issues in this area.",
-        });
-        e.target.value = "";
-        return;
-      }
-      if (resolvingIssue.status === "Resolved" || isVerifying) {
-        e.target.value = "";
-        return;
-      }
-      const file0 = file;
-      const reader = new FileReader();
-
-      reader.onload = async () => {
-        const afterImageBase64 = reader.result as string;
-        setIsVerifying(true);
-        setVerificationResult(null);
-
-        try {
-          const response = await fetch("/api/verify-resolution", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              beforeImage: resolvingIssue.imageUrl,
-              afterImage: afterImageBase64,
-              mimeType: file0.type || "image/jpeg",
-              category: resolvingIssue.category,
-            }),
-          });
-
-          const data = await response.json();
-          if (!response.ok) throw new Error(data.error || "Verification failed.");
-
-          setVerificationResult(data.verification);
-
-          if (data.verification.isResolved) {
-            // Idempotent: the transaction flips status once; rapid re-clicks
-            // and points double-awards are impossible.
-            const didResolve = await resolveIssue(
-              resolvingIssue.id,
-              currentUser.uid,
-              {
-                resolvedImageUrl: afterImageBase64,
-                resolutionConfidence: data.verification.confidence,
-                resolutionNotes: data.verification.notes,
-              },
-            );
-            if (didResolve) {
-              const resolvedObj = {
-                ...resolvingIssue,
-                status: "Resolved" as const,
-                resolvedImageUrl: afterImageBase64,
-                resolutionConfidence: data.verification.confidence,
-                resolutionNotes: data.verification.notes,
-              };
-              setSelectedIssue(resolvedObj);
-              if (onSelectIssue) onSelectIssue(resolvedObj);
-              fireConfetti();
-            }
-
-            setTimeout(() => {
-              setResolvingIssue(null);
-              setVerificationResult(null);
-            }, 3000);
-          }
-        } catch (err) {
-          setVerificationResult({
-            isResolved: false,
-            confidence: 0,
-            notes:
-              err instanceof Error ? err.message : "Could not verify the fix.",
-          });
-        } finally {
-          setIsVerifying(false);
-          e.target.value = "";
-        }
-      };
-      reader.readAsDataURL(file);
-    }
-  };
-
+  // Open the proof-gated resolution popup for the selected issue.
   const startResolution = (issue: CivicIssue, e: React.MouseEvent) => {
     e.stopPropagation();
-    if (issue.status === "Resolved" || isVerifying) return;
-    setResolvingIssue(issue);
-    if (fileInputRef.current) fileInputRef.current.click();
+    if (issue.status === "Resolved") return;
+    setResolveModalIssue(issue);
   };
 
   // RULE B — Official Staff Override: promote straight to "Staff Verified".
@@ -764,7 +781,7 @@ export default function CommandMap({
         <div className="flex items-center justify-center h-full bg-gray-50 dark:bg-gray-900 text-center p-6 font-sans">
           <div className="max-w-md bg-white dark:bg-gray-800 p-8 rounded-3xl shadow-sm border border-[#E5E5E5] dark:border-gray-700">
             <h2 className="text-xl font-semibold mb-4 text-[#1A1A1A] dark:text-white">
-              Google Maps API Key Required
+              <T>Google Maps API Key Required</T>
             </h2>
             <p className="text-sm text-[#717171] dark:text-gray-300 mb-2 font-medium text-left">
               <strong>Step 1:</strong>{" "}
@@ -774,7 +791,7 @@ export default function CommandMap({
                 rel="noopener"
                 className="text-primary underline"
               >
-                Get an API Key
+                <T>Get an API Key</T>
               </a>
             </p>
             <p className="text-sm text-[#717171] dark:text-gray-300 mb-2 font-medium text-left">
@@ -782,21 +799,21 @@ export default function CommandMap({
             </p>
             <ul className="text-left text-sm text-[#717171] dark:text-gray-400 leading-relaxed list-disc list-inside mb-4">
               <li>
-                Open <strong>Settings</strong> (⚙️ gear icon, top-right)
+                <T>Open</T> <strong><T>Settings</T></strong> (⚙️ gear icon, top-right)
               </li>
               <li>
-                Select <strong>Secrets</strong>
+                <T>Select</T> <strong><T>Secrets</T></strong>
               </li>
               <li>
-                Type <code>GOOGLE_MAPS_PLATFORM_KEY</code>, press{" "}
-                <strong>Enter</strong>
+                <T>Type</T> <code>GOOGLE_MAPS_PLATFORM_KEY</code>, press{" "}
+                <strong><T>Enter</T></strong>
               </li>
               <li>
-                Paste your API key, press <strong>Enter</strong>
+                <T>Paste your API key, press</T> <strong><T>Enter</T></strong>
               </li>
             </ul>
             <p className="text-xs text-[#9CA3AF] italic">
-              The app rebuilds automatically.
+              <T>The app rebuilds automatically.</T>
             </p>
           </div>
         </div>
@@ -857,7 +874,7 @@ export default function CommandMap({
             {showZones && (
               <div className="bg-white/90 dark:bg-gray-900/90 backdrop-blur rounded-xl shadow-md border border-gray-200 dark:border-gray-700 p-2.5 max-w-[9rem]">
                 <p className="text-[9px] font-bold uppercase tracking-wider text-gray-400 mb-1.5">
-                  BBMP Zones
+                  <T>BBMP Zones</T>
                 </p>
                 <div className="grid grid-cols-1 gap-1">
                   {Object.entries(ZONE_COLORS).map(([z, c]) => (
@@ -885,7 +902,7 @@ export default function CommandMap({
             onClick={() => setFilterCategory("All")}
             className={`px-4 py-2 rounded-full text-xs font-bold transition-colors cursor-pointer shrink-0 ${filterCategory === "All" ? "bg-primary text-white" : "text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-white/10"}`}
           >
-            All
+            <T>All</T>
           </button>
           {[
             "Pothole",
@@ -922,7 +939,7 @@ export default function CommandMap({
               }}
               className="text-xs px-3 py-2 rounded-xl bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 text-gray-900 dark:text-white font-medium cursor-pointer outline-none"
             >
-              <option value="All">All Cities</option>
+              <option value="All"><T>All Cities</T></option>
               {cityOptions.map((c) => (
                 <option key={c} value={c}>
                   {c}
@@ -934,7 +951,7 @@ export default function CommandMap({
               onChange={(e) => setWardFilter(e.target.value)}
               className="text-xs px-3 py-2 rounded-xl bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 text-gray-900 dark:text-white font-medium cursor-pointer outline-none"
             >
-              <option value="All">All Wards</option>
+              <option value="All"><T>All Wards</T></option>
               {wardOptions.map((w) => (
                 <option key={w} value={w}>
                   {w}
@@ -949,7 +966,7 @@ export default function CommandMap({
                 }}
                 className="text-xs font-bold text-red-600 dark:text-red-400 px-3 py-2 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-xl"
               >
-                Clear
+                <T>Clear</T>
               </button>
             )}
           </div>
@@ -987,7 +1004,7 @@ export default function CommandMap({
                 <div className="w-12 h-1.5 bg-gray-300 dark:bg-gray-700 rounded-full" />
               </div>
 
-              <div className="px-6 pb-6 overflow-y-auto no-scrollbar flex-1">
+              <div className="px-6 pb-28 overflow-y-auto no-scrollbar flex-1">
                 <div className="flex justify-between items-start mb-4">
                   <div>
                     <PlacesContext location={{ lat: selectedIssue.latitude, lng: selectedIssue.longitude }} />
@@ -1020,6 +1037,14 @@ export default function CommandMap({
                       </span>
                       {selectedIssue.ward && ` • Ward: ${selectedIssue.ward}`}
                     </p>
+                    {isStaff && selectedIssue.reportedByPhone && (
+                      <a
+                        href={`tel:${selectedIssue.reportedByPhone}`}
+                        className="text-xs font-bold text-blue-600 dark:text-blue-400 mt-1 inline-flex items-center gap-1 hover:underline"
+                      >
+                        <Phone className="w-3 h-3" /> Call {selectedIssue.reportedByPhone}
+                      </a>
+                    )}
                     {selectedIssue.duplicateCount &&
                       selectedIssue.duplicateCount > 1 && (
                         <p className="text-xs text-orange-600 font-bold mt-1 bg-orange-50 inline-block px-2 py-0.5 rounded-full border border-orange-200">
@@ -1035,37 +1060,43 @@ export default function CommandMap({
                   </button>
                 </div>
 
-                <div
-                  className="relative rounded-2xl overflow-hidden bg-gray-100 dark:bg-gray-800 h-40 sm:h-48 mb-5 sm:mb-6 group cursor-pointer"
-                  onClick={() => setIsImageModalOpen(true)}
-                >
-                  <img
-                    src={
-                      selectedIssue.imageUrl ||
-                      "https://images.unsplash.com/photo-1515162305285-0293e4767cc2?q=80&w=400&auto=format&fit=crop"
-                    }
-                    alt={selectedIssue.category}
-                    className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-105"
-                  />
-                  <div className="absolute inset-0 bg-black/20 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
-                    <span className="bg-white/90 dark:bg-black/90 text-gray-900 dark:text-white px-3 py-1.5 rounded-full text-xs font-bold backdrop-blur-sm">
-                      View Full Screen
-                    </span>
+                {/* Only show the photo when the report actually has one
+                    (description-only reports skip it). No stock-photo fallback. */}
+                {selectedIssue.imageUrl ? (
+                  <div
+                    className="relative rounded-2xl overflow-hidden bg-gray-100 dark:bg-gray-800 h-40 sm:h-48 mb-5 sm:mb-6 group cursor-pointer"
+                    onClick={() => setIsImageModalOpen(true)}
+                  >
+                    <img
+                      src={selectedIssue.imageUrl}
+                      alt={selectedIssue.category}
+                      className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-105"
+                    />
+                    <div className="absolute inset-0 bg-black/20 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
+                      <span className="bg-white/90 dark:bg-black/90 text-gray-900 dark:text-white px-3 py-1.5 rounded-full text-xs font-bold backdrop-blur-sm">
+                        <T>View Full Screen</T>
+                      </span>
+                    </div>
+                    <div className="absolute bottom-3 left-3 bg-semantic-success font-bold text-white px-3 py-1.5 rounded-full text-[10px] uppercase tracking-wide shadow-sm flex items-center gap-1.5">
+                      {selectedIssue.status === "Resolved" && (
+                        <CheckCircle className="w-3 h-3" />
+                      )}
+                      {selectedIssue.status}
+                    </div>
                   </div>
-                  <div className="absolute bottom-3 left-3 bg-semantic-success font-bold text-white px-3 py-1.5 rounded-full text-[10px] uppercase tracking-wide shadow-sm flex items-center gap-1.5">
-                    {selectedIssue.status === "Resolved" && (
-                      <CheckCircle className="w-3 h-3" />
-                    )}
-                    {selectedIssue.status}
+                ) : (
+                  <div className="flex items-center gap-2 mb-5 sm:mb-6 px-3 py-2.5 rounded-2xl bg-gray-50 dark:bg-gray-800/50 border border-dashed border-gray-200 dark:border-gray-700 text-xs text-gray-500 dark:text-gray-400">
+                    <ImageOff className="w-4 h-4 shrink-0" />
+                    Description-only report — no photo attached.
                   </div>
-                </div>
+                )}
 
                 {/* Before / After comparison once an issue is resolved. */}
                 {selectedIssue.status === "Resolved" &&
                   selectedIssue.resolvedImageUrl && (
                     <div className="mb-6">
                       <h4 className="text-[10px] text-gray-500 dark:text-gray-400 uppercase font-bold mb-2 tracking-widest">
-                        Before / After
+                        <T>Before / After</T>
                       </h4>
                       <div className="grid grid-cols-2 gap-2">
                         <div className="relative rounded-xl overflow-hidden h-28 bg-gray-100 dark:bg-gray-800">
@@ -1075,7 +1106,7 @@ export default function CommandMap({
                             className="w-full h-full object-cover"
                           />
                           <span className="absolute bottom-1 left-1 bg-black/60 text-white text-[9px] font-bold uppercase px-1.5 py-0.5 rounded">
-                            Before
+                            <T>Before</T>
                           </span>
                         </div>
                         <div className="relative rounded-xl overflow-hidden h-28 bg-gray-100 dark:bg-gray-800">
@@ -1085,7 +1116,7 @@ export default function CommandMap({
                             className="w-full h-full object-cover"
                           />
                           <span className="absolute bottom-1 left-1 bg-emerald-600 text-white text-[9px] font-bold uppercase px-1.5 py-0.5 rounded">
-                            After
+                            <T>After</T>
                           </span>
                         </div>
                       </div>
@@ -1098,22 +1129,91 @@ export default function CommandMap({
                   )}
 
                 <div className="bg-gray-50 dark:bg-gray-800/50 rounded-2xl p-4 text-sm text-gray-600 dark:text-gray-300 italic mb-6 leading-relaxed border border-gray-100 dark:border-gray-700">
-                  "{selectedIssue.description || "No summary provided."}"
+                  "{translatedDescription || selectedIssue.description || "No summary provided."}"
                 </div>
+
+                {/* Resolution PDF: citizen owner + in-scope staff (hierarchical). */}
+                {(selectedIssue.status === "Resolved" ||
+                  (selectedIssue.escalationHistory?.length || 0) > 0) &&
+                  canViewReport(scope, selectedIssue, currentUser?.uid) && (
+                    <button
+                      onClick={() => downloadResolutionPdf(selectedIssue)}
+                      className="w-full mb-6 py-3 rounded-2xl border border-primary/40 bg-primary/5 text-primary text-xs font-bold uppercase tracking-widest flex items-center justify-center gap-2 hover:bg-primary/10 transition-colors cursor-pointer"
+                    >
+                      <FileText className="w-4 h-4" /> {t("actions.downloadReport")}
+                    </button>
+                  )}
+
+                {/* Escalation banner: shows when a report has been re-opened. */}
+                {selectedIssue.status === "Escalated" && (
+                  <div className="mb-6 p-3 rounded-2xl bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 text-amber-800 dark:text-amber-300 text-xs">
+                    <strong><T>Re-opened by the reporter.</T></strong> Escalated to the{" "}
+                    {escalationTierLabel(selectedIssue.escalationLevel)} for another look
+                    {selectedIssue.escalationReason
+                      ? ` — "${selectedIssue.escalationReason}"`
+                      : "."}
+                  </div>
+                )}
+
+                {/* Re-escalation: the citizen owner can re-open a resolved issue. */}
+                {selectedIssue.status === "Resolved" &&
+                  currentUser?.uid === selectedIssue.reportedByUid && (
+                    <div className="mb-6">
+                      {!escalateOpen ? (
+                        <button
+                          onClick={() => setEscalateOpen(true)}
+                          className="w-full py-3 rounded-2xl border border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-900/20 text-amber-700 dark:text-amber-400 text-xs font-bold uppercase tracking-widest hover:bg-amber-100 dark:hover:bg-amber-900/30 transition-colors cursor-pointer"
+                        >
+                          {t("actions.escalate")}
+                        </button>
+                      ) : (
+                        <div className="p-4 rounded-2xl border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-900/20 space-y-3">
+                          <p className="text-xs font-bold text-amber-800 dark:text-amber-300">
+                            <T>Why are you re-opening this issue?</T>
+                          </p>
+                          <textarea
+                            value={escalateReason}
+                            onChange={(e) => setEscalateReason(e.target.value)}
+                            rows={3}
+                            placeholder="e.g. The pothole was only partly filled and has reopened."
+                            className="w-full text-xs p-3 bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-xl outline-none focus:ring-2 focus:ring-amber-400 text-gray-900 dark:text-white resize-none"
+                          />
+                          {escalateError && (
+                            <p className="text-xs text-red-600 dark:text-red-400">{escalateError}</p>
+                          )}
+                          <div className="flex gap-2">
+                            <button
+                              onClick={() => { setEscalateOpen(false); setEscalateError(null); }}
+                              className="flex-1 py-2.5 rounded-full border border-gray-200 dark:border-gray-700 text-xs font-bold text-gray-700 dark:text-gray-200 cursor-pointer"
+                            >
+                              <T>Cancel</T>
+                            </button>
+                            <button
+                              onClick={submitEscalation}
+                              disabled={escalating || escalateReason.trim().length < 4}
+                              className="flex-1 py-2.5 rounded-full bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold transition-colors cursor-pointer disabled:opacity-50"
+                            >
+                              {escalating ? "Escalating…" : "Escalate"}
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
 
                 {/* Status Timeline */}
                 <div className="mb-6">
                   <h4 className="text-[10px] text-gray-500 dark:text-gray-400 uppercase font-bold mb-3 tracking-widest">
-                    Status Timeline
+                    <T>Status Timeline</T>
                   </h4>
                   <div className="relative border-l-2 border-gray-200 dark:border-gray-700 ml-2 space-y-4">
                     <div className="relative pl-5">
                       <div className="absolute -left-[9px] top-1 w-4 h-4 rounded-full bg-primary ring-4 ring-white dark:ring-gray-900" />
                       <p className="text-xs font-bold text-gray-900 dark:text-white">
-                        Reported
+                        <T>Reported</T>
                       </p>
                       <p className="text-[10px] text-gray-500">
-                        Citizen Submission
+                        <T>Citizen Submission</T>
                       </p>
                     </div>
                     {selectedIssue.status !== "Reported" && (
@@ -1125,7 +1225,7 @@ export default function CommandMap({
                           {selectedIssue.status}
                         </p>
                         <p className="text-[10px] text-gray-500">
-                          System Update
+                          <T>System Update</T>
                         </p>
                       </div>
                     )}
@@ -1144,8 +1244,8 @@ export default function CommandMap({
                       <ThumbsUp className="w-4 h-4" />
                       {currentUser &&
                       (selectedIssue.upvotedBy || []).includes(currentUser.uid)
-                        ? "Upvoted"
-                        : "Me Too"}
+                        ? t("actions.upvoted")
+                        : t("actions.meToo")}
                       <span className="bg-black/10 dark:bg-white/10 px-2 py-0.5 rounded-full ml-1">
                         {selectedIssue.upvotesCount || 0}
                       </span>
@@ -1163,15 +1263,10 @@ export default function CommandMap({
                       <motion.button
                         whileTap={{ scale: 0.95 }}
                         onClick={(e) => startResolution(selectedIssue, e)}
-                        disabled={isVerifying}
-                        className="flex-1 bg-gray-900 dark:bg-white text-white dark:text-gray-900 py-3.5 rounded-2xl font-bold text-xs uppercase tracking-widest flex justify-center items-center gap-2 transition-colors cursor-pointer shadow-sm disabled:opacity-50"
+                        className="flex-1 bg-gray-900 dark:bg-white text-white dark:text-gray-900 py-3.5 rounded-2xl font-bold text-xs uppercase tracking-widest flex justify-center items-center gap-2 transition-colors cursor-pointer shadow-sm"
                       >
-                        {isVerifying ? (
-                          <img src="/civic-logo.svg" className="w-4 h-4 animate-pulse brightness-0 invert dark:invert-0" alt="Verifying" />
-                        ) : (
-                          <CheckCircle className="w-4 h-4" />
-                        )}
-                        {isVerifying ? "Verifying..." : "Resolve Issue"}
+                        <CheckCircle className="w-4 h-4" />
+                        {t("actions.resolveIssue")}
                       </motion.button>
                     )}
                 </div>
@@ -1189,8 +1284,8 @@ export default function CommandMap({
                     >
                       <ShieldCheck className="w-4 h-4" />
                       {approvingId === selectedIssue.id
-                        ? "Approving…"
-                        : "Corroborate & Approve"}
+                        ? t("actions.approving")
+                        : t("actions.corroborate")}
                     </motion.button>
                   )}
 
@@ -1207,34 +1302,29 @@ export default function CommandMap({
                   />
                 )}
 
-                <CommentsSection selectedIssue={selectedIssue} currentUser={currentUser} />
-
-                {verificationResult && !verificationResult.isResolved && (
-                  <div className="mt-4 p-3 bg-red-50 dark:bg-red-900/30 border border-red-200 dark:border-red-800 text-red-600 dark:text-red-400 text-xs rounded-xl">
-                    <strong>
-                      Resolution Failed ({verificationResult.confidence}%
-                      confidence):
-                    </strong>{" "}
-                    {verificationResult.notes}
-                  </div>
-                )}
+                <CommentsSection selectedIssue={selectedIssue} currentUser={currentUser} isStaff={isStaff} />
               </div>
             </div>
           </motion.div>
         )}
       </AnimatePresence>
 
-      <input
-        type="file"
-        ref={fileInputRef}
-        onChange={handleFileChange}
-        accept="image/*"
-        className="hidden"
-      />
+      {/* Proof-gated resolution popup (prompt → verifying → result). */}
+      {resolveModalIssue && (
+        <ResolveProofModal
+          issue={resolveModalIssue}
+          currentUser={currentUser}
+          onClose={() => setResolveModalIssue(null)}
+          onResolved={(r) => {
+            setSelectedIssue((prev) => (prev && prev.id === r.id ? { ...prev, ...r } : prev));
+            if (onSelectIssue) onSelectIssue(r);
+          }}
+        />
+      )}
 
       {/* Expand Image Modal */}
       <AnimatePresence>
-        {isImageModalOpen && selectedIssue && (
+        {isImageModalOpen && selectedIssue && selectedIssue.imageUrl && (
           <motion.div
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
@@ -1247,10 +1337,7 @@ export default function CommandMap({
               animate={{ scale: 1, opacity: 1 }}
               exit={{ scale: 0.9, opacity: 0 }}
               transition={{ type: "spring", damping: 25 }}
-              src={
-                selectedIssue.imageUrl ||
-                "https://images.unsplash.com/photo-1515162305285-0293e4767cc2?q=80&w=400&auto=format&fit=crop"
-              }
+              src={selectedIssue.imageUrl}
               alt="Expanded"
               className="max-w-full max-h-[90vh] rounded-2xl object-contain shadow-2xl cursor-default"
               onClick={(e) => e.stopPropagation()}

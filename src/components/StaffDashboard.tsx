@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from "react";
+import { T } from "../lib/translate";
 import {
   BarChart,
   Bar,
@@ -11,7 +12,9 @@ import {
   Cell,
 } from "recharts";
 import { Sparkles, Send, Loader2, RotateCw } from "lucide-react";
+import { useTranslation } from "react-i18next";
 import { CivicIssue, UserScope } from "../types";
+import { aiLanguageName } from "../i18n";
 
 interface DashboardProps {
   issues: CivicIssue[];
@@ -35,12 +38,16 @@ let cachedInsights: any[] = [];
 let cachedHotspots: any[] = [];
 let cachedBriefing: string = "";
 let cachedReady = false;
+let cachedLang = "English"; // language the cached AI output was generated in
 
 export default function StaffDashboard({ issues, scope }: DashboardProps) {
+  useTranslation(); // subscribe so the dashboard re-renders on language change
+  const lang = aiLanguageName();
+  const langReady = cachedReady && cachedLang === lang;
   const [insights, setInsights] = useState<any[]>(cachedInsights);
   const [hotspots, setHotspots] = useState<any[]>(cachedHotspots);
   const [briefing, setBriefing] = useState<string>(cachedBriefing);
-  const [loading, setLoading] = useState(!cachedReady);
+  const [loading, setLoading] = useState(!langReady);
   const [refreshing, setRefreshing] = useState(false);
   const didInit = useRef(false);
 
@@ -67,7 +74,7 @@ export default function StaffDashboard({ issues, scope }: DashboardProps) {
       const res = await fetch("/api/staff-query", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question, scope }),
+        body: JSON.stringify({ question, scope, language: aiLanguageName() }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Query failed.");
@@ -128,12 +135,12 @@ export default function StaffDashboard({ issues, scope }: DashboardProps) {
         fetch("/api/predictive-insights", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ issues: issues.slice(0, 50) }),
+          body: JSON.stringify({ issues: issues.slice(0, 50), language: aiLanguageName() }),
         }).then((res) => res.json()),
         fetch("/api/daily-briefing", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ stats }),
+          body: JSON.stringify({ stats, language: aiLanguageName() }),
         }).then((res) => res.json()),
       ]);
 
@@ -150,6 +157,7 @@ export default function StaffDashboard({ issues, scope }: DashboardProps) {
         cachedBriefing = briefingRes.briefing;
       }
       cachedReady = true;
+      cachedLang = aiLanguageName();
     } catch (err) {
       console.error(err);
     } finally {
@@ -158,18 +166,20 @@ export default function StaffDashboard({ issues, scope }: DashboardProps) {
     }
   };
 
-  // Fetch exactly ONCE, when issue data first becomes available. Reuses the
-  // session cache on remount (tab switches) and never refetches on live updates.
+  // Fetch when issue data first becomes available, OR when the UI language
+  // changes (so the briefing/insights are regenerated in the new language).
+  // Reuses the session cache on tab switches; never refetches on live updates.
   useEffect(() => {
-    if (cachedReady) {
+    if (langReady) {
       setLoading(false);
       return;
     }
-    if (didInit.current || issues.length === 0) return;
+    if (issues.length === 0) return;
     didInit.current = true;
+    setLoading(true);
     runFetch();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [issues.length]);
+  }, [issues.length, lang]);
 
   const categoryData = issues.reduce((acc: any, curr) => {
     const cat = curr.category || "Other";
@@ -193,7 +203,7 @@ export default function StaffDashboard({ issues, scope }: DashboardProps) {
         <div className="col-span-1 md:col-span-2 bg-white dark:bg-gray-800 p-4 sm:p-6 rounded-2xl shadow-sm border border-gray-100 dark:border-gray-700">
           <div className="flex items-center justify-between mb-4">
             <h3 className="text-sm font-bold uppercase tracking-widest text-gray-500 dark:text-gray-400">
-              Daily Briefing Agent
+              <T>Daily Briefing Agent</T>
             </h3>
             <button
               onClick={runFetch}
@@ -209,7 +219,7 @@ export default function StaffDashboard({ issues, scope }: DashboardProps) {
           </div>
           {loading ? (
             <div className="animate-pulse flex gap-2">
-              <div className="w-4 h-4 bg-primary rounded-full"></div> Loading...
+              <div className="w-4 h-4 bg-primary rounded-full"></div> <T>Loading...</T>
             </div>
           ) : (
             <p className="text-base sm:text-xl font-light text-gray-900 dark:text-white leading-relaxed">
@@ -220,7 +230,7 @@ export default function StaffDashboard({ issues, scope }: DashboardProps) {
 
         <div className="bg-white dark:bg-gray-800 p-4 sm:p-6 rounded-2xl shadow-sm border border-gray-100 dark:border-gray-700">
           <h3 className="text-sm font-bold uppercase tracking-widest text-gray-500 dark:text-gray-400 mb-4">
-            Resolution Funnel
+            <T>Resolution Funnel</T>
           </h3>
           <div className="h-48">
             <ResponsiveContainer width="100%" height="100%">
@@ -255,7 +265,7 @@ export default function StaffDashboard({ issues, scope }: DashboardProps) {
           Ask Your City
         </h3>
         <p className="text-xs text-gray-400 dark:text-gray-500 mb-4">
-          Ask in plain language — the agent queries live data and shows its work.
+          <T>Ask in plain language — the agent queries live data and shows its work.</T>
         </p>
 
         <div className="relative flex items-center">
@@ -311,7 +321,7 @@ export default function StaffDashboard({ issues, scope }: DashboardProps) {
             )}
             {asking && !answer ? (
               <p className="text-sm text-gray-400 animate-pulse">
-                Querying live data…
+                <T>Querying live data…</T>
               </p>
             ) : (
               <p className="text-sm text-gray-900 dark:text-white leading-relaxed whitespace-pre-wrap">
@@ -325,10 +335,10 @@ export default function StaffDashboard({ issues, scope }: DashboardProps) {
       {!loading && hotspots.length > 0 && (
         <div className="bg-white dark:bg-gray-800 p-4 sm:p-6 rounded-2xl shadow-sm border border-gray-100 dark:border-gray-700">
           <h3 className="text-sm font-bold uppercase tracking-widest text-gray-500 dark:text-gray-400 mb-1">
-            Detected Hotspots
+            <T>Detected Hotspots</T>
           </h3>
           <p className="text-xs text-gray-400 dark:text-gray-500 mb-4">
-            Geospatial clusters of unresolved same-category reports — likely systemic root causes.
+            <T>Geospatial clusters of unresolved same-category reports — likely systemic root causes.</T>
           </p>
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
             {hotspots.map((h, idx) => (
@@ -358,7 +368,7 @@ export default function StaffDashboard({ issues, scope }: DashboardProps) {
 
       <div className="bg-white dark:bg-gray-800 p-4 sm:p-6 rounded-2xl shadow-sm border border-gray-100 dark:border-gray-700">
         <h3 className="text-sm font-bold uppercase tracking-widest text-gray-500 mb-4">
-          Predictive Insight Agents
+          <T>Predictive Insight Agents</T>
         </h3>
         <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
           {loading
@@ -394,7 +404,7 @@ export default function StaffDashboard({ issues, scope }: DashboardProps) {
 
       <div className="bg-white dark:bg-gray-800 p-4 sm:p-6 rounded-2xl shadow-sm border border-gray-100 dark:border-gray-700">
         <h3 className="text-sm font-bold uppercase tracking-widest text-gray-500 mb-4">
-          Issues by Category
+          <T>Issues by Category</T>
         </h3>
         <div className="h-64">
           <ResponsiveContainer width="100%" height="100%">

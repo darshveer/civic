@@ -134,6 +134,16 @@ service cloud.firestore {
         && !(resource.data.get('status', 'Reported') in ['Staff Verified', 'Resolved', 'Flagged for Review']);
     }
 
+    // Re-escalation (citizen-driven): the report's OWNER may re-open a Resolved
+    // issue they filed if dissatisfied. Only the escalation fields may change,
+    // only Resolved -> Escalated, and only on their own report.
+    function isValidEscalation() {
+      return affected().hasOnly(['status', 'escalationLevel', 'escalationCount', 'escalationReason', 'escalationHistory'])
+        && request.resource.data.status == 'Escalated'
+        && resource.data.get('status', '') == 'Resolved'
+        && resource.data.reportedByUid == uid();
+    }
+
     match /issues/{issueId} {
       // Public read: the civic map is public, and the server reads issues
       // unauthenticated for AI triage/chat. Writes stay locked down below.
@@ -145,6 +155,7 @@ service cloud.firestore {
         || isCommentEdit()
         || isPetitionEdit()
         || isValidCommunityVerification()  // Trust Engine Rule A (cross-user)
+        || isValidEscalation()       // citizen re-opens their own resolved report
         || canActOn(resource.data)   // staff status/assignment/resolution in scope
       );
       allow delete: if canActOn(resource.data);

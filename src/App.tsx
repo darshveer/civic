@@ -4,6 +4,9 @@
  */
 
 import React, { useState, useEffect, useRef, Suspense, lazy } from "react";
+import { T } from "./lib/translate";
+import { useTranslation } from "react-i18next";
+import { SUPPORTED_LANGS } from "./i18n";
 import { motion, AnimatePresence } from "motion/react";
 import {
   auth,
@@ -94,6 +97,7 @@ import {
 type TabType = "reporter" | "map" | "impact" | "staff-list" | "staff-analytics" | "staff-kanban" | "admin";
 
 export default function App() {
+  const { t, i18n } = useTranslation();
   const [user, setUser] = useState<User | null>(null);
   const [profile, setProfile] = useState<CitizenProfile | null>(null);
   const [issues, setIssues] = useState<CivicIssue[]>([]);
@@ -159,6 +163,7 @@ export default function App() {
   const [email, setEmail] = useState<string>("");
   const [password, setPassword] = useState<string>("");
   const [name, setName] = useState<string>("");
+  const [phone, setPhone] = useState<string>("");
   const [authError, setAuthError] = useState<string | null>(null);
   const [authLoading, setAuthLoading] = useState<boolean>(false);
   // Email-OTP registration flow.
@@ -459,6 +464,10 @@ export default function App() {
       setAuthError("Password must be at least 6 characters.");
       return;
     }
+    if (!/^[+]?[0-9][0-9 ()-]{6,14}$/.test(phone.trim())) {
+      setAuthError("Please enter a valid mobile number (7–15 digits).");
+      return;
+    }
     setAuthLoading(true);
     try {
       const res = await fetch("/api/send-otp", {
@@ -513,11 +522,12 @@ export default function App() {
           joinedAt: Date.now(),
           impactPoints: 20,
           civicRank: "Civic Novice",
-          reportsCount: 0
+          reportsCount: 0,
+          phone: phone.trim(),
         }, { merge: true });
-        
+
         // Also update local state so UI reflects the name immediately without a refresh
-        setProfile(prev => prev ? { ...prev, displayName: finalName, photoURL: finalPhoto } : null);
+        setProfile(prev => prev ? { ...prev, displayName: finalName, photoURL: finalPhoto, phone: phone.trim() } : null);
         setUser({ ...cred.user, displayName: finalName, photoURL: finalPhoto } as any);
       } catch (e) {
         console.error("Failed to patch new user profile:", e);
@@ -797,6 +807,8 @@ export default function App() {
       case "Requires Human Verification":
       case "Verify Report":
         return "bg-rose-50 text-rose-700 border-rose-200";
+      case "Escalated":
+        return "bg-amber-50 text-amber-700 border-amber-300 dark:bg-amber-900/30 dark:text-amber-400";
       case "Pending Verification":
       case "Reported":
       default:
@@ -863,7 +875,7 @@ export default function App() {
               {!isStaff && (
                 <div className="text-right hidden sm:block">
                   <div className="text-xs font-bold text-[#4A4A4A] dark:text-gray-400 uppercase tracking-wider">
-                    Civic Rank
+                    <T>Civic Rank</T>
                   </div>
                   <div className="text-sm text-[#717171] dark:text-gray-300">
                     {profile?.civicRank || "Civic Novice"}
@@ -873,13 +885,26 @@ export default function App() {
               {isStaff && (
                 <div className="text-right hidden sm:block">
                   <div className="text-xs font-bold text-blue-600 dark:text-blue-400 uppercase tracking-wider">
-                    Staff Role
+                    <T>Staff Role</T>
                   </div>
                   <div className="text-sm text-blue-700 dark:text-blue-300 font-semibold">
                     {tierLabel(scope.tier)}
                   </div>
                 </div>
               )}
+
+              <select
+                value={(i18n.language || "en").split("-")[0]}
+                onChange={(e) => i18n.changeLanguage(e.target.value)}
+                title="Language"
+                className="text-xs font-bold bg-white/70 dark:bg-gray-800/70 border border-gray-200 dark:border-gray-700 rounded-full px-2.5 py-2 text-gray-700 dark:text-gray-200 outline-none cursor-pointer"
+              >
+                {SUPPORTED_LANGS.map((l) => (
+                  <option key={l.code} value={l.code}>
+                    {l.label}
+                  </option>
+                ))}
+              </select>
 
               <button
                 onClick={() => setIsDropdownOpen(!isDropdownOpen)}
@@ -914,7 +939,7 @@ export default function App() {
                 <div className="absolute right-0 top-12 mt-2 w-64 bg-white dark:bg-gray-900 rounded-2xl border border-[#E5E5E5] dark:border-gray-800 shadow-xl py-2 z-50 animate-in fade-in slide-in-from-top-3 duration-200">
                   <div className="px-4 py-3 border-b border-[#F0F0F0] dark:border-gray-800">
                     <p className="text-[10px] text-[#717171] dark:text-gray-400 font-bold uppercase tracking-wider">
-                      Signed In As
+                      <T>Signed In As</T>
                     </p>
                     <p className="text-xs font-semibold text-[#1A1A1A] dark:text-white truncate">
                       {profile?.displayName || "Citizen Hero"}
@@ -950,7 +975,7 @@ export default function App() {
                         }}
                         className="mt-2 w-full text-center text-[10px] font-bold uppercase tracking-wider text-red-600 dark:text-red-400 hover:bg-red-100/60 dark:hover:bg-red-900/20 rounded-lg py-1.5 transition-colors cursor-pointer"
                       >
-                        View all notifications
+                        <T>View all notifications</T>
                       </button>
                     </div>
                   )}
@@ -1057,7 +1082,7 @@ export default function App() {
                   C.I.V.I.C.
                 </h1>
                 <p className="text-gray-500 dark:text-gray-400 text-sm font-medium tracking-wide">
-                  Report it. Track it. Fix it together.
+                  <T>Report it. Track it. Fix it together.</T>
                 </p>
               </div>
 
@@ -1070,7 +1095,7 @@ export default function App() {
                   }}
                   className={`flex-1 py-2.5 rounded-xl text-xs font-bold transition-all duration-300 ${loginRoleTab === "citizen" ? "bg-white dark:bg-gray-700 shadow-md text-gray-900 dark:text-white" : "text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white hover:bg-gray-200/50 dark:hover:bg-gray-700/50"}`}
                 >
-                  Citizen
+                  <T>Citizen</T>
                 </button>
                 <button
                   type="button"
@@ -1084,7 +1109,7 @@ export default function App() {
                   }}
                   className={`flex-1 py-2.5 rounded-xl text-xs font-bold transition-all duration-300 ${loginRoleTab === "staff" ? "bg-white dark:bg-gray-700 shadow-md text-gray-900 dark:text-white" : "text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white hover:bg-gray-200/50 dark:hover:bg-gray-700/50"}`}
                 >
-                  Staff / Admin
+                  <T>Staff / Admin</T>
                 </button>
               </div>
 
@@ -1118,13 +1143,13 @@ export default function App() {
                         alt="Google logo"
                         className="w-5 h-5"
                       />
-                      <span>Continue with Google</span>
+                      <span><T>Continue with Google</T></span>
                     </button>
 
                     <div className="relative flex py-4 items-center">
                       <div className="flex-grow border-t border-gray-200 dark:border-gray-700"></div>
                       <span className="flex-shrink mx-4 text-[10px] uppercase font-bold tracking-widest text-gray-400 dark:text-gray-500">
-                        OR
+                        <T>OR</T>
                       </span>
                       <div className="flex-grow border-t border-gray-200 dark:border-gray-700"></div>
                     </div>
@@ -1135,7 +1160,7 @@ export default function App() {
                   <div className="space-y-4 animate-in fade-in slide-in-from-right-3 duration-200">
                     <div className="text-center">
                       <p className="text-sm text-gray-700 dark:text-gray-300">
-                        Enter the 6-digit code we sent to
+                        <T>Enter the 6-digit code we sent to</T>
                       </p>
                       <p className="text-sm font-bold text-gray-900 dark:text-white break-all">
                         {email}
@@ -1158,7 +1183,7 @@ export default function App() {
                       className="block w-full text-center tracking-[0.5em] text-lg font-bold px-4 py-3.5 bg-white/50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-700 rounded-2xl focus:outline-none focus:ring-2 focus:ring-primary text-gray-900 dark:text-white"
                     />
                     <p className="text-[11px] text-gray-500 dark:text-gray-400 text-center">
-                      Didn't get it? Check your <strong>spam / junk</strong> folder
+                      <T>Didn't get it? Check your</T> <strong><T>spam / junk</T></strong> folder
                       (it can take a minute to arrive).
                     </p>
                     <button
@@ -1210,7 +1235,22 @@ export default function App() {
                         required
                         className="block w-full px-4 py-3.5 text-sm bg-white/50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-700 rounded-2xl appearance-none focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent peer text-gray-900 dark:text-white backdrop-blur-sm transition-all"
                       />
-                      <label htmlFor="name" className="absolute text-sm text-gray-500 dark:text-gray-400 duration-300 transform -translate-y-4 scale-75 top-2 z-10 origin-[0] bg-transparent px-2 peer-focus:px-2 peer-placeholder-shown:scale-100 peer-placeholder-shown:-translate-y-1/2 peer-placeholder-shown:top-1/2 peer-focus:top-2 peer-focus:scale-75 peer-focus:-translate-y-4 left-2">Full Name</label>
+                      <label htmlFor="name" className="absolute text-sm text-gray-500 dark:text-gray-400 duration-300 transform -translate-y-4 scale-75 top-2 z-10 origin-[0] bg-transparent px-2 peer-focus:px-2 peer-placeholder-shown:scale-100 peer-placeholder-shown:-translate-y-1/2 peer-placeholder-shown:top-1/2 peer-focus:top-2 peer-focus:scale-75 peer-focus:-translate-y-4 left-2">{t("auth.fullName")}</label>
+                    </motion.div>
+                  )}
+                  {isAuthMode === "register" && (
+                    <motion.div initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }} className="relative">
+                      <input
+                        type="tel"
+                        id="phone"
+                        inputMode="tel"
+                        placeholder=" "
+                        value={phone}
+                        onChange={(e) => setPhone(e.target.value)}
+                        required
+                        className="block w-full px-4 py-3.5 text-sm bg-white/50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-700 rounded-2xl appearance-none focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent peer text-gray-900 dark:text-white backdrop-blur-sm transition-all"
+                      />
+                      <label htmlFor="phone" className="absolute text-sm text-gray-500 dark:text-gray-400 duration-300 transform -translate-y-4 scale-75 top-2 z-10 origin-[0] bg-transparent px-2 peer-focus:px-2 peer-placeholder-shown:scale-100 peer-placeholder-shown:-translate-y-1/2 peer-placeholder-shown:top-1/2 peer-focus:top-2 peer-focus:scale-75 peer-focus:-translate-y-4 left-2">{t("auth.mobile")}</label>
                     </motion.div>
                   )}
                   <div className="relative">
@@ -1223,7 +1263,7 @@ export default function App() {
                       required
                       className="block w-full px-4 py-3.5 text-sm bg-white/50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-700 rounded-2xl appearance-none focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent peer text-gray-900 dark:text-white backdrop-blur-sm transition-all"
                     />
-                    <label htmlFor="email" className="absolute text-sm text-gray-500 dark:text-gray-400 duration-300 transform -translate-y-4 scale-75 top-2 z-10 origin-[0] bg-transparent px-2 peer-focus:px-2 peer-placeholder-shown:scale-100 peer-placeholder-shown:-translate-y-1/2 peer-placeholder-shown:top-1/2 peer-focus:top-2 peer-focus:scale-75 peer-focus:-translate-y-4 left-2">Email Address</label>
+                    <label htmlFor="email" className="absolute text-sm text-gray-500 dark:text-gray-400 duration-300 transform -translate-y-4 scale-75 top-2 z-10 origin-[0] bg-transparent px-2 peer-focus:px-2 peer-placeholder-shown:scale-100 peer-placeholder-shown:-translate-y-1/2 peer-placeholder-shown:top-1/2 peer-focus:top-2 peer-focus:scale-75 peer-focus:-translate-y-4 left-2">{t("auth.email")}</label>
                   </div>
                   <div className="relative">
                     <input
@@ -1236,7 +1276,7 @@ export default function App() {
                       minLength={6}
                       className="block w-full px-4 py-3.5 text-sm bg-white/50 dark:bg-gray-800/50 border border-gray-200 dark:border-gray-700 rounded-2xl appearance-none focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent peer text-gray-900 dark:text-white backdrop-blur-sm transition-all"
                     />
-                    <label htmlFor="password" className="absolute text-sm text-gray-500 dark:text-gray-400 duration-300 transform -translate-y-4 scale-75 top-2 z-10 origin-[0] bg-transparent px-2 peer-focus:px-2 peer-placeholder-shown:scale-100 peer-placeholder-shown:-translate-y-1/2 peer-placeholder-shown:top-1/2 peer-focus:top-2 peer-focus:scale-75 peer-focus:-translate-y-4 left-2">Password</label>
+                    <label htmlFor="password" className="absolute text-sm text-gray-500 dark:text-gray-400 duration-300 transform -translate-y-4 scale-75 top-2 z-10 origin-[0] bg-transparent px-2 peer-focus:px-2 peer-placeholder-shown:scale-100 peer-placeholder-shown:-translate-y-1/2 peer-placeholder-shown:top-1/2 peer-focus:top-2 peer-focus:scale-75 peer-focus:-translate-y-4 left-2">{t("auth.password")}</label>
                   </div>
                   <button
                     type="submit"
@@ -1246,7 +1286,7 @@ export default function App() {
                     {authLoading ? (
                       <img src="/civic-logo.svg" className="w-5 h-5 animate-pulse invert" alt="Loading" />
                     ) : (
-                      isAuthMode === "login" ? "Sign In" : "Send Verification Code"
+                      isAuthMode === "login" ? t("auth.signIn") : t("auth.sendCode")
                     )}
                   </button>
                 </form>
@@ -1280,7 +1320,7 @@ export default function App() {
                       disabled={authLoading}
                       className="text-xs text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white font-semibold transition-colors flex items-center justify-center gap-1.5 mx-auto"
                     >
-                      <span>Continue as Guest</span>
+                      <span><T>Continue as Guest</T></span>
                     </button>
                   </div>
                 )}
@@ -1307,7 +1347,7 @@ export default function App() {
                     <div className="absolute inset-0 border-2 border-primary/20 border-t-primary rounded-full animate-spin w-16 h-16 -m-3"></div>
                     <img src="/civic-logo.svg" className="w-10 h-10 animate-pulse dark:invert opacity-80 z-10" alt="Loading view" />
                   </div>
-                  <p className="text-sm text-gray-500 font-medium animate-pulse mt-4">Loading...</p>
+                  <p className="text-sm text-gray-500 font-medium animate-pulse mt-4"><T>Loading...</T></p>
                 </div>
               }>
                 <AnimatePresence mode="wait">
@@ -1320,7 +1360,7 @@ export default function App() {
                     className={activeTab === "map" ? "h-full w-full" : ""}
                   >
                     {activeTab === "reporter" && (
-                      <Reporter currentUser={user} onSuccess={handleReportScored} isDarkMode={isDarkMode} />
+                      <Reporter currentUser={user} profile={profile} onSuccess={handleReportScored} isDarkMode={isDarkMode} />
                     )}
                     {activeTab === "map" && (
                       <CommandMap
@@ -1366,7 +1406,7 @@ export default function App() {
 
       {user && profile && !isStaff && (
         <Suspense fallback={null}>
-          <CivicAssistant currentUser={user} issues={issues} />
+          <CivicAssistant currentUser={user} profile={profile} issues={issues} />
         </Suspense>
       )}
 
@@ -1395,7 +1435,7 @@ export default function App() {
                 <span
                   className={`relative z-10 transition-colors hidden sm:inline-block ${activeTab === "reporter" ? "text-white" : "text-gray-600 dark:text-gray-300 group-hover:text-gray-900 dark:group-hover:text-white"}`}
                 >
-                  Report
+                  {t("nav.report")}
                 </span>
               </button>
             )}
@@ -1420,7 +1460,7 @@ export default function App() {
               <span
                 className={`relative z-10 transition-colors hidden sm:inline-block ${activeTab === "map" ? "text-white" : "text-gray-600 dark:text-gray-300 group-hover:text-gray-900 dark:group-hover:text-white"}`}
               >
-                Map
+                {t("nav.map")}
               </span>
             </button>
 
@@ -1447,7 +1487,7 @@ export default function App() {
                   <span
                     className={`relative z-10 transition-colors hidden sm:inline-block ${activeTab === "staff-analytics" ? "text-white" : "text-gray-600 dark:text-gray-300 group-hover:text-gray-900 dark:group-hover:text-white"}`}
                   >
-                    Analytics
+                    {t("nav.dashboard")}
                   </span>
                 </button>
                 <button
@@ -1471,7 +1511,7 @@ export default function App() {
                   <span
                     className={`relative z-10 transition-colors hidden sm:inline-block ${activeTab === "staff-kanban" ? "text-white" : "text-gray-600 dark:text-gray-300 group-hover:text-gray-900 dark:group-hover:text-white"}`}
                   >
-                    Board
+                    {t("nav.board")}
                   </span>
                 </button>
                 <button
@@ -1495,7 +1535,7 @@ export default function App() {
                   <span
                     className={`relative z-10 transition-colors hidden sm:inline-block ${activeTab === "staff-list" ? "text-white" : "text-gray-600 dark:text-gray-300 group-hover:text-gray-900 dark:group-hover:text-white"}`}
                   >
-                    Archive
+                    <T>Archive</T>
                   </span>
                 </button>
               </>
@@ -1519,7 +1559,7 @@ export default function App() {
                 <span
                   className={`relative z-10 transition-colors hidden sm:inline-block ${activeTab === "impact" ? "text-white" : "text-gray-600 dark:text-gray-300 group-hover:text-gray-900 dark:group-hover:text-white"}`}
                 >
-                  Impact
+                  {t("nav.impact")}
                 </span>
               </button>
             )}
@@ -1542,7 +1582,7 @@ export default function App() {
                 <span
                   className={`relative z-10 transition-colors hidden sm:inline-block ${activeTab === "admin" ? "text-white" : "text-gray-600 dark:text-gray-300 group-hover:text-gray-900 dark:group-hover:text-white"}`}
                 >
-                  Admin
+                  {t("nav.admin")}
                 </span>
               </button>
             )}
@@ -1609,7 +1649,7 @@ export default function App() {
             {/* Change Profile Picture */}
             <div className="space-y-3">
               <h4 className="text-xs font-bold text-[#717171] uppercase tracking-wider">
-                Change Profile Avatar
+                <T>Change Profile Avatar</T>
               </h4>
               <div className="grid grid-cols-5 sm:grid-cols-10 gap-2">
                 {[
@@ -1657,7 +1697,7 @@ export default function App() {
                   type="submit"
                   className="bg-gray-900 dark:bg-white hover:bg-gray-800 dark:hover:bg-gray-200 text-white dark:text-gray-900 text-[10px] font-bold uppercase tracking-widest px-4 py-2 rounded-xl transition-colors cursor-pointer"
                 >
-                  Apply
+                  <T>Apply</T>
                 </button>
               </form>
             </div>
@@ -1778,13 +1818,13 @@ export default function App() {
                       onClick={() => setLeaderboardCity("Bangalore")}
                       className={`px-2.5 py-1 rounded-md transition-colors ${leaderboardCity === "Bangalore" ? "bg-white dark:bg-gray-800 text-gray-900 dark:text-white shadow-sm" : "text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white"}`}
                     >
-                      Bangalore
+                      <T>Bangalore</T>
                     </button>
                     <button
                       onClick={() => setLeaderboardCity("Other")}
                       className={`px-2.5 py-1 rounded-md transition-colors ${leaderboardCity === "Other" ? "bg-white dark:bg-gray-800 text-gray-900 dark:text-white shadow-sm" : "text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white"}`}
                     >
-                      Other
+                      <T>Other</T>
                     </button>
                   </div>
                 </div>
@@ -1810,7 +1850,7 @@ export default function App() {
                             {entry.displayName}
                             {entry.isCurrent && (
                               <span className="text-[9px] text-emerald-600 dark:text-emerald-400 bg-emerald-100 dark:bg-emerald-900/50 px-1.5 py-0.5 rounded-md font-bold uppercase tracking-widest scale-90 shrink-0">
-                                You
+                                <T>You</T>
                               </span>
                             )}
                           </p>
@@ -1823,7 +1863,7 @@ export default function App() {
                         <p className="font-bold text-gray-900 dark:text-white font-mono text-xs">
                           {entry.impactPoints}{" "}
                           <span className="text-[10px] text-[#717171] dark:text-gray-500 font-sans font-normal">
-                            pts
+                            <T>pts</T>
                           </span>
                         </p>
                         <p className="text-[9px] text-gray-400 font-medium">
@@ -1853,7 +1893,7 @@ export default function App() {
 
             <div>
               <h3 className="text-xl font-light tracking-tight text-gray-900 dark:text-white">
-                Your Civic Reports
+                <T>Your Civic Reports</T>
               </h3>
               <p className="text-xs text-[#717171] dark:text-gray-400 mt-1">
                 Review and locate all municipal infrastructure filings under
@@ -1866,7 +1906,7 @@ export default function App() {
               <div className="text-center py-16 bg-gray-50 dark:bg-gray-800/50 rounded-2xl border border-dashed border-gray-200 dark:border-gray-700 space-y-3 p-6">
                 <FileText className="w-10 h-10 text-gray-300 dark:text-gray-600 mx-auto" />
                 <h4 className="font-semibold text-gray-700 dark:text-gray-300 text-sm">
-                  No Filings Logged
+                  <T>No Filings Logged</T>
                 </h4>
                 <p className="text-xs text-gray-400 dark:text-gray-500 max-w-xs mx-auto">
                   You haven't logged any infrastructure issues under this
@@ -1879,7 +1919,7 @@ export default function App() {
                   }}
                   className="bg-gray-900 dark:bg-white hover:bg-gray-800 dark:hover:bg-gray-200 text-white dark:text-gray-900 text-[10px] font-bold uppercase tracking-widest px-5 py-2.5 rounded-full transition-all cursor-pointer shadow-sm"
                 >
-                  File First Report
+                  <T>File First Report</T>
                 </button>
               </div>
             ) : (
@@ -1888,22 +1928,22 @@ export default function App() {
                   <thead className="bg-gray-50/75 dark:bg-gray-800/30">
                     <tr>
                       <th className="px-5 py-3.5 text-[10px] font-bold text-gray-400 uppercase tracking-widest">
-                        Visual
+                        <T>Visual</T>
                       </th>
                       <th className="px-5 py-3.5 text-[10px] font-bold text-gray-400 uppercase tracking-widest">
-                        Issue Detail
+                        <T>Issue Detail</T>
                       </th>
                       <th className="px-5 py-3.5 text-[10px] font-bold text-gray-400 uppercase tracking-widest">
-                        Authority Department
+                        <T>Authority Department</T>
                       </th>
                       <th className="px-5 py-3.5 text-[10px] font-bold text-gray-400 uppercase tracking-widest">
-                        Civic Status
+                        <T>Civic Status</T>
                       </th>
                       <th className="px-5 py-3.5 text-[10px] font-bold text-gray-400 uppercase tracking-widest text-center">
-                        Upvotes
+                        <T>Upvotes</T>
                       </th>
                       <th className="px-5 py-3.5 text-[10px] font-bold text-gray-400 uppercase tracking-widest text-right">
-                        Actions
+                        <T>Actions</T>
                       </th>
                     </tr>
                   </thead>
@@ -1925,7 +1965,7 @@ export default function App() {
                                 />
                               ) : (
                                 <div className="w-full h-full flex items-center justify-center text-[10px] text-gray-400 bg-gray-50 dark:bg-gray-800">
-                                  No Image
+                                  <T>No Image</T>
                                 </div>
                               )}
                             </div>
@@ -1961,7 +2001,7 @@ export default function App() {
                               }}
                               className="text-xs text-blue-600 hover:text-blue-800 font-bold uppercase tracking-wider flex items-center gap-1 ml-auto cursor-pointer"
                             >
-                              Show on Map
+                              <T>Show on Map</T>
                               <ChevronRight className="w-4 h-4" />
                             </button>
                           </td>
@@ -1987,7 +2027,7 @@ export default function App() {
               <X className="w-5 h-5" />
             </button>
             <h3 className="text-xl font-display font-bold tracking-tight text-gray-900 dark:text-white mb-5">
-              Account Security
+              <T>Account Security</T>
             </h3>
             <TwoFactorSettings currentUser={user} isAdmin={isAdminAccount} />
           </div>
@@ -2012,7 +2052,7 @@ export default function App() {
                 Notifications
               </h3>
               <p className="text-xs text-[#717171] dark:text-gray-400 mt-1">
-                Status updates on every issue you've reported.
+                <T>Status updates on every issue you've reported.</T>
               </p>
             </div>
 
@@ -2020,10 +2060,10 @@ export default function App() {
               <div className="text-center py-16 bg-gray-50 dark:bg-gray-800/50 rounded-2xl border border-dashed border-gray-200 dark:border-gray-700 space-y-3">
                 <Bell className="w-10 h-10 text-gray-300 dark:text-gray-600 mx-auto" />
                 <p className="text-sm font-semibold text-gray-700 dark:text-gray-300">
-                  You're all caught up
+                  <T>You're all caught up</T>
                 </p>
                 <p className="text-xs text-gray-400 dark:text-gray-500 max-w-xs mx-auto">
-                  When the status of a report you filed changes, it'll show up here.
+                  <T>When the status of a report you filed changes, it'll show up here.</T>
                 </p>
               </div>
             ) : (
@@ -2069,7 +2109,7 @@ export default function App() {
                           }}
                           className="shrink-0 text-xs text-blue-600 dark:text-blue-400 hover:text-blue-800 font-bold uppercase tracking-wider flex items-center gap-1 cursor-pointer mt-1"
                         >
-                          View
+                          <T>View</T>
                           <ChevronRight className="w-4 h-4" />
                         </button>
                       )}

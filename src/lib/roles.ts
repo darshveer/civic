@@ -65,7 +65,34 @@ export function statusOptions(current: CivicStatus): CivicStatus[] {
 export function statusLabel(status: CivicStatus | string): string {
   if (status === "Requires Human Verification") return "Verify Report";
   if (status === "Corroborated Report") return "Corroborated";
+  if (status === "Escalated") return "Escalated / Re-opened";
   return status;
+}
+
+/**
+ * May this user download the resolution report for an issue? The original
+ * reporter always can; staff can for issues their scope covers (hierarchical:
+ * field=ward, zonal=zone, city=all).
+ */
+export function canViewReport(
+  scope: UserScope,
+  issue: CivicIssue,
+  uid: string | undefined,
+): boolean {
+  if (uid && issue.reportedByUid === uid) return true;
+  return canActOnIssue(scope, issue);
+}
+
+/** The staff tier that owns an issue at a given escalation level. */
+export function tierForEscalationLevel(level: number | undefined): StaffTier {
+  if ((level || 0) >= 2) return "city";
+  if ((level || 0) === 1) return "zonal";
+  return "field";
+}
+
+/** Human label for the authority an issue has been escalated to. */
+export function escalationTierLabel(level: number | undefined): string {
+  return tierLabel(tierForEscalationLevel(level));
 }
 
 /**

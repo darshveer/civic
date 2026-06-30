@@ -4,6 +4,7 @@
  */
 
 import React, { useState } from "react";
+import { T } from "../lib/translate";
 import { db, corroborateAndApprove } from "../lib/firebase";
 import {
   canActOnIssue,
@@ -34,8 +35,14 @@ import {
   X,
   ChevronDown,
   ShieldCheck,
+  Phone,
+  Download,
+  ImageOff,
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
+import CreateComplaintModal from "./CreateComplaintModal";
+import ResolveProofModal from "./ResolveProofModal";
+import { downloadResolutionPdf } from "../lib/resolutionPdf";
 
 interface StaffReportsListProps {
   issues: CivicIssue[];
@@ -71,6 +78,9 @@ export default function StaffReportsList({
     string | null
   >(null);
   const [selectedIssues, setSelectedIssues] = useState<Set<string>>(new Set());
+  const [showCreateComplaint, setShowCreateComplaint] = useState(false);
+  // Proof-gated resolution popup (prompt → verifying → result).
+  const [resolveModalIssue, setResolveModalIssue] = useState<CivicIssue | null>(null);
 
   const activeFilterCount =
     (statusFilter !== "All" ? 1 : 0) +
@@ -178,6 +188,14 @@ export default function StaffReportsList({
 
   const handleBulkUpdate = async (status: CivicStatus) => {
     if (selectedIssues.size === 0) return;
+    // Resolution needs an after-photo per report, so it can't be done in bulk.
+    if (status === "Resolved") {
+      setActionMessage(
+        "Resolution needs an after-photo per report — resolve each one individually.",
+      );
+      setTimeout(() => setActionMessage(null), 4000);
+      return;
+    }
     try {
       // Only issue docs change — points/counts are derived live from issues,
       // so there is nothing to denormalize (and rules forbid staff writing
@@ -249,6 +267,12 @@ export default function StaffReportsList({
     issueId: string,
     newStatus: CivicStatus,
   ) => {
+    // Resolving requires an after-photo — open the proof popup, don't write directly.
+    if (newStatus === "Resolved") {
+      const issue = issues.find((i) => i.id === issueId);
+      if (issue) setResolveModalIssue(issue);
+      return;
+    }
     try {
       await updateDoc(doc(db, "issues", issueId), { status: newStatus });
       setActionMessage(`Status updated to "${newStatus}"`);
@@ -343,6 +367,8 @@ export default function StaffReportsList({
         return "bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-900/30 dark:text-amber-400 dark:border-amber-800";
       case "Flagged for Review":
         return "bg-red-50 text-red-700 border-red-300 dark:bg-red-900/30 dark:text-red-400 dark:border-red-800";
+      case "Escalated":
+        return "bg-amber-50 text-amber-700 border-amber-300 dark:bg-amber-900/30 dark:text-amber-400 dark:border-amber-800";
       default:
         return "bg-gray-50 text-gray-700 border-gray-200 dark:bg-gray-800 dark:text-gray-400 dark:border-gray-700";
     }
@@ -358,7 +384,7 @@ export default function StaffReportsList({
             Staff Control Dashboard
           </h2>
           <p className="text-sm text-[#717171] dark:text-gray-400 mt-2">
-            Review, verify, and resolve issues reported across municipal bounds.
+            <T>Review, verify, and resolve issues reported across municipal bounds.</T>
           </p>
         </div>
 
@@ -423,34 +449,34 @@ export default function StaffReportsList({
                 {/* Category Filter */}
                 <div>
                   <label className="block text-[9px] font-bold text-[#717171] dark:text-gray-400 uppercase tracking-wider mb-1">
-                    Category
+                    <T>Category</T>
                   </label>
                   <select
                     value={categoryFilter}
                     onChange={(e) => setCategoryFilter(e.target.value)}
                     className="w-full text-xs px-3 min-h-[44px] bg-white dark:bg-gray-900 border border-[#E5E5E5] dark:border-gray-700 rounded-xl focus:outline-none focus:ring-2 focus:ring-primary text-[#1A1A1A] dark:text-white font-medium cursor-pointer"
                   >
-                    <option value="All">All Categories</option>
-                    <option value="Pothole">Pothole</option>
-                    <option value="Water Leak">Water Leak</option>
-                    <option value="Vandalism">Vandalism</option>
-                    <option value="Streetlight Out">Streetlight Out</option>
-                    <option value="Waste Issue">Waste Issue</option>
-                    <option value="Other">Other</option>
+                    <option value="All"><T>All Categories</T></option>
+                    <option value="Pothole"><T>Pothole</T></option>
+                    <option value="Water Leak"><T>Water Leak</T></option>
+                    <option value="Vandalism"><T>Vandalism</T></option>
+                    <option value="Streetlight Out"><T>Streetlight Out</T></option>
+                    <option value="Waste Issue"><T>Waste Issue</T></option>
+                    <option value="Other"><T>Other</T></option>
                   </select>
                 </div>
 
                 {/* Status Filter */}
                 <div>
                   <label className="block text-[9px] font-bold text-[#717171] dark:text-gray-400 uppercase tracking-wider mb-1">
-                    Status
+                    <T>Status</T>
                   </label>
                   <select
                     value={statusFilter}
                     onChange={(e) => setStatusFilter(e.target.value)}
                     className="w-full text-xs px-3 min-h-[44px] bg-white dark:bg-gray-900 border border-[#E5E5E5] dark:border-gray-700 rounded-xl focus:outline-none focus:ring-2 focus:ring-primary text-[#1A1A1A] dark:text-white font-medium cursor-pointer"
                   >
-                    <option value="All">All Statuses</option>
+                    <option value="All"><T>All Statuses</T></option>
                     {STAFF_ASSIGNABLE_STATUSES.map((s) => (
                       <option key={s} value={s}>
                         {statusLabel(s)}
@@ -458,14 +484,14 @@ export default function StaffReportsList({
                     ))}
                     {/* Read-only: community-earned, never staff-assignable, but
                         staff can filter to find these and promote them. */}
-                    <option value="Community Verified">Community Verified</option>
+                    <option value="Community Verified"><T>Community Verified</T></option>
                   </select>
                 </div>
 
                 {/* Cascading geography: State → City → Zone → Ward */}
                 <div>
                   <label className="block text-[9px] font-bold text-[#717171] dark:text-gray-400 uppercase tracking-wider mb-1">
-                    State
+                    <T>State</T>
                   </label>
                   <select
                     value={stateFilter}
@@ -477,7 +503,7 @@ export default function StaffReportsList({
                     }}
                     className="w-full text-xs px-3 min-h-[44px] bg-white dark:bg-gray-900 border border-[#E5E5E5] dark:border-gray-700 rounded-xl focus:outline-none focus:ring-2 focus:ring-primary text-[#1A1A1A] dark:text-white font-medium cursor-pointer"
                   >
-                    <option value="All">All States</option>
+                    <option value="All"><T>All States</T></option>
                     {stateOptions.map((s) => (
                       <option key={s} value={s}>
                         {s}
@@ -488,7 +514,7 @@ export default function StaffReportsList({
 
                 <div>
                   <label className="block text-[9px] font-bold text-[#717171] dark:text-gray-400 uppercase tracking-wider mb-1">
-                    City
+                    <T>City</T>
                   </label>
                   <select
                     value={cityFilter}
@@ -499,7 +525,7 @@ export default function StaffReportsList({
                     }}
                     className="w-full text-xs px-3 min-h-[44px] bg-white dark:bg-gray-900 border border-[#E5E5E5] dark:border-gray-700 rounded-xl focus:outline-none focus:ring-2 focus:ring-primary text-[#1A1A1A] dark:text-white font-medium cursor-pointer"
                   >
-                    <option value="All">All Cities</option>
+                    <option value="All"><T>All Cities</T></option>
                     {cityOptions.map((c) => (
                       <option key={c} value={c}>
                         {c}
@@ -510,7 +536,7 @@ export default function StaffReportsList({
 
                 <div>
                   <label className="block text-[9px] font-bold text-[#717171] dark:text-gray-400 uppercase tracking-wider mb-1">
-                    Zone
+                    <T>Zone</T>
                   </label>
                   <select
                     value={zoneFilter}
@@ -520,7 +546,7 @@ export default function StaffReportsList({
                     }}
                     className="w-full text-xs px-3 min-h-[44px] bg-white dark:bg-gray-900 border border-[#E5E5E5] dark:border-gray-700 rounded-xl focus:outline-none focus:ring-2 focus:ring-primary text-[#1A1A1A] dark:text-white font-medium cursor-pointer"
                   >
-                    <option value="All">All Zones</option>
+                    <option value="All"><T>All Zones</T></option>
                     {zoneOptions.map((z) => (
                       <option key={z} value={z}>
                         {z}
@@ -531,14 +557,14 @@ export default function StaffReportsList({
 
                 <div>
                   <label className="block text-[9px] font-bold text-[#717171] dark:text-gray-400 uppercase tracking-wider mb-1">
-                    Ward
+                    <T>Ward</T>
                   </label>
                   <select
                     value={wardFilter}
                     onChange={(e) => setWardFilter(e.target.value)}
                     className="w-full text-xs px-3 min-h-[44px] bg-white dark:bg-gray-900 border border-[#E5E5E5] dark:border-gray-700 rounded-xl focus:outline-none focus:ring-2 focus:ring-primary text-[#1A1A1A] dark:text-white font-medium cursor-pointer"
                   >
-                    <option value="All">All Wards</option>
+                    <option value="All"><T>All Wards</T></option>
                     {wardOptions.map((w) => (
                       <option key={w} value={w}>
                         {w}
@@ -550,17 +576,17 @@ export default function StaffReportsList({
                 {/* Severity Filter */}
                 <div>
                   <label className="block text-[9px] font-bold text-[#717171] dark:text-gray-400 uppercase tracking-wider mb-1">
-                    Severity
+                    <T>Severity</T>
                   </label>
                   <select
                     value={severityFilter}
                     onChange={(e) => setSeverityFilter(e.target.value)}
                     className="w-full text-xs px-3 min-h-[44px] bg-white dark:bg-gray-900 border border-[#E5E5E5] dark:border-gray-700 rounded-xl focus:outline-none focus:ring-2 focus:ring-primary text-[#1A1A1A] dark:text-white font-medium cursor-pointer"
                   >
-                    <option value="All">All Severities</option>
-                    <option value="High">High (8-10)</option>
-                    <option value="Medium">Medium (5-7)</option>
-                    <option value="Low">Low (1-4)</option>
+                    <option value="All"><T>All Severities</T></option>
+                    <option value="High"><T>High (8-10)</T></option>
+                    <option value="Medium"><T>Medium (5-7)</T></option>
+                    <option value="Low"><T>Low (1-4)</T></option>
                   </select>
                 </div>
               </div>
@@ -571,7 +597,7 @@ export default function StaffReportsList({
                     onClick={clearAllFilters}
                     className="text-xs font-bold text-red-600 dark:text-red-400 min-h-[44px] px-4 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-xl transition-colors"
                   >
-                    Clear All Filters
+                    <T>Clear All Filters</T>
                   </button>
                 </div>
               )}
@@ -604,7 +630,7 @@ export default function StaffReportsList({
               }}
               className="text-xs bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg px-3 py-1.5 focus:outline-none text-gray-700 dark:text-gray-300 font-bold"
             >
-              <option value="">Bulk Update Status...</option>
+              <option value=""><T>Bulk Update Status...</T></option>
               {STAFF_ASSIGNABLE_STATUSES.map((s) => (
                 <option key={s} value={s}>
                   {statusLabel(s)}
@@ -621,13 +647,42 @@ export default function StaffReportsList({
         </button>
       </div>
 
+      {/* Staff complaint intake (letters / emails / phone calls) */}
+      <div className="flex justify-end -mt-2">
+        <button
+          onClick={() => setShowCreateComplaint(true)}
+          className="flex items-center gap-2 text-xs font-bold text-white bg-primary hover:bg-primary-dark px-4 py-2 rounded-full transition-colors cursor-pointer shadow-sm"
+        >
+          <FileText className="w-4 h-4" /> Create Complaint
+        </button>
+      </div>
+
+      {showCreateComplaint && (
+        <CreateComplaintModal
+          currentUser={currentUser}
+          onClose={() => setShowCreateComplaint(false)}
+          onCreated={() =>
+            setActionMessage("Complaint filed — it now appears in the queue.")
+          }
+        />
+      )}
+
+      {/* Proof-gated resolution popup (prompt → verifying → result). */}
+      {resolveModalIssue && (
+        <ResolveProofModal
+          issue={resolveModalIssue}
+          currentUser={currentUser}
+          onClose={() => setResolveModalIssue(null)}
+        />
+      )}
+
       {/* Reports List — compact cards on mobile, full table on desktop. */}
       <div className="md:overflow-x-auto overflow-y-auto md:max-h-[600px] glass-card rounded-3xl mt-2 relative">
         {filteredIssues.length === 0 ? (
           <div className="p-12 text-center text-[#717171] dark:text-gray-400 flex flex-col items-center justify-center space-y-3">
             <AlertTriangle className="w-8 h-8 text-[#9CA3AF] stroke-1" />
             <p className="text-sm">
-              No reports matching your active filters were found.
+              <T>No reports matching your active filters were found.</T>
             </p>
           </div>
         ) : (
@@ -666,7 +721,9 @@ export default function StaffReportsList({
                     {issue.imageUrl ? (
                       <img src={issue.imageUrl} alt="" className="w-full h-full object-cover" />
                     ) : (
-                      <span className="text-[9px] text-gray-400">No img</span>
+                      <span className="w-full h-full flex items-center justify-center text-gray-300 dark:text-gray-600">
+                        <ImageOff className="w-4 h-4" />
+                      </span>
                     )}
                   </button>
 
@@ -727,6 +784,14 @@ export default function StaffReportsList({
                       {issue.reportedByName || "Citizen"} ·{" "}
                       {new Date(issue.reportedAt).toLocaleDateString()}
                     </div>
+                    {issue.reportedByPhone && (
+                      <a
+                        href={`tel:${issue.reportedByPhone}`}
+                        className="text-[10px] font-bold text-blue-600 dark:text-blue-400 inline-flex items-center gap-1 hover:underline"
+                      >
+                        <Phone className="w-3 h-3" /> {issue.reportedByPhone}
+                      </a>
+                    )}
 
                     <div className="flex items-center gap-2 pt-0.5">
                       <select
@@ -750,7 +815,7 @@ export default function StaffReportsList({
                           }}
                           className="shrink-0 text-[10px] font-bold text-blue-600 dark:text-blue-400 px-2 py-1.5 rounded-lg border border-blue-100 dark:border-blue-900/50 hover:bg-blue-50 dark:hover:bg-blue-900/20"
                         >
-                          Map
+                          <T>Map</T>
                         </button>
                       )}
                     </div>
@@ -776,25 +841,25 @@ export default function StaffReportsList({
                   />
                 </th>
                 <th className="px-6 py-4 text-[10px] font-bold text-[#717171] dark:text-gray-400 uppercase tracking-wider">
-                  Report
+                  <T>Report</T>
                 </th>
                 <th className="px-6 py-4 text-[10px] font-bold text-[#717171] dark:text-gray-400 uppercase tracking-wider">
-                  Category
+                  <T>Category</T>
                 </th>
                 <th className="px-6 py-4 text-[10px] font-bold text-[#717171] dark:text-gray-400 uppercase tracking-wider">
-                  Location
+                  <T>Location</T>
                 </th>
                 <th className="px-6 py-4 text-[10px] font-bold text-[#717171] dark:text-gray-400 uppercase tracking-wider">
-                  Reporter
+                  <T>Reporter</T>
                 </th>
                 <th className="px-6 py-4 text-[10px] font-bold text-[#717171] dark:text-gray-400 uppercase tracking-wider">
-                  Status
+                  <T>Status</T>
                 </th>
                 <th className="px-6 py-4 text-[10px] font-bold text-[#717171] dark:text-gray-400 uppercase tracking-wider">
-                  Upvotes
+                  <T>Upvotes</T>
                 </th>
                 <th className="px-6 py-4 text-[10px] font-bold text-[#717171] dark:text-gray-400 uppercase tracking-wider text-right">
-                  Actions
+                  <T>Actions</T>
                 </th>
               </tr>
             </thead>
@@ -822,7 +887,7 @@ export default function StaffReportsList({
                   >
                     <td className="px-0 py-2 md:px-4 md:py-2.5 block md:table-cell border-b border-gray-100 dark:border-gray-800 md:border-0">
                       <div className="flex items-center justify-between md:justify-start">
-                        <span className="md:hidden text-[10px] font-bold text-gray-500 uppercase tracking-wider">Select</span>
+                        <span className="md:hidden text-[10px] font-bold text-gray-500 uppercase tracking-wider"><T>Select</T></span>
                         <input
                           type="checkbox"
                           checked={selectedIssues.has(issue.id)}
@@ -833,7 +898,7 @@ export default function StaffReportsList({
                     </td>
                     {/* Thumbnail & description */}
                     <td className="px-0 py-3 md:px-4 md:py-2.5 max-w-sm block md:table-cell border-b border-gray-100 dark:border-gray-800 md:border-0">
-                      <div className="md:hidden text-[10px] font-bold text-gray-500 uppercase tracking-wider mb-2">Report</div>
+                      <div className="md:hidden text-[10px] font-bold text-gray-500 uppercase tracking-wider mb-2"><T>Report</T></div>
                       <div className="flex items-center gap-3">
                         <div
                           className="w-10 h-10 rounded-xl bg-gray-100 dark:bg-gray-800 overflow-hidden shrink-0 border border-[#E5E5E5] dark:border-gray-700 cursor-pointer relative group"
@@ -853,8 +918,8 @@ export default function StaffReportsList({
                               </div>
                             </>
                           ) : (
-                            <div className="w-full h-full flex items-center justify-center text-gray-400 bg-gray-50 dark:bg-gray-800">
-                              No img
+                            <div className="w-full h-full flex items-center justify-center text-gray-300 dark:text-gray-600 bg-gray-50 dark:bg-gray-800">
+                              <ImageOff className="w-4 h-4" />
                             </div>
                           )}
                         </div>
@@ -882,7 +947,7 @@ export default function StaffReportsList({
 
                     {/* Category & Severity */}
                     <td className="px-0 py-3 md:px-4 md:py-2.5 whitespace-nowrap block md:table-cell border-b border-gray-100 dark:border-gray-800 md:border-0">
-                      <div className="md:hidden text-[10px] font-bold text-gray-500 uppercase tracking-wider mb-2">Category & Severity</div>
+                      <div className="md:hidden text-[10px] font-bold text-gray-500 uppercase tracking-wider mb-2"><T>Category & Severity</T></div>
                       <div className="flex flex-col gap-1">
                         <span className="font-bold text-[#1A1A1A] dark:text-white">
                           {issue.category}
@@ -902,7 +967,7 @@ export default function StaffReportsList({
 
                     {/* Location */}
                     <td className="px-0 py-3 md:px-4 md:py-2.5 whitespace-nowrap block md:table-cell border-b border-gray-100 dark:border-gray-800 md:border-0">
-                      <div className="md:hidden text-[10px] font-bold text-gray-500 uppercase tracking-wider mb-2">Location</div>
+                      <div className="md:hidden text-[10px] font-bold text-gray-500 uppercase tracking-wider mb-2"><T>Location</T></div>
                       <div className="flex flex-col gap-0.5">
                         <span className="font-bold text-[#1a1a1a] dark:text-white flex items-center gap-1">
                           <MapPin className="w-3.5 h-3.5 text-[#3B82F6]" />
@@ -920,7 +985,7 @@ export default function StaffReportsList({
                             }}
                             className="text-left text-blue-600 dark:text-blue-400 hover:underline text-[10px] font-semibold mt-0.5 cursor-pointer min-h-[44px] md:min-h-[auto] flex items-center"
                           >
-                            Locate on Map
+                            <T>Locate on Map</T>
                           </button>
                         )}
                       </div>
@@ -928,11 +993,19 @@ export default function StaffReportsList({
 
                     {/* Reporter Name & Date */}
                     <td className="px-0 py-3 md:px-4 md:py-2.5 whitespace-nowrap block md:table-cell border-b border-gray-100 dark:border-gray-800 md:border-0">
-                      <div className="md:hidden text-[10px] font-bold text-gray-500 uppercase tracking-wider mb-2">Reporter</div>
+                      <div className="md:hidden text-[10px] font-bold text-gray-500 uppercase tracking-wider mb-2"><T>Reporter</T></div>
                       <div className="flex flex-col">
                         <span className="font-medium text-[#1A1A1A] dark:text-white">
                           {issue.reportedByName || "Citizen"}
                         </span>
+                        {issue.reportedByPhone && (
+                          <a
+                            href={`tel:${issue.reportedByPhone}`}
+                            className="text-[10px] font-bold text-blue-600 dark:text-blue-400 inline-flex items-center gap-1 hover:underline"
+                          >
+                            <Phone className="w-3 h-3" /> {issue.reportedByPhone}
+                          </a>
+                        )}
                         <span className="text-[10px] text-[#717171] dark:text-gray-400">
                           {new Date(issue.reportedAt).toLocaleDateString()}
                         </span>
@@ -941,7 +1014,7 @@ export default function StaffReportsList({
 
                     {/* Status Select dropdown */}
                     <td className="px-0 py-3 md:px-4 md:py-2.5 whitespace-nowrap block md:table-cell border-b border-gray-100 dark:border-gray-800 md:border-0">
-                      <div className="md:hidden text-[10px] font-bold text-gray-500 uppercase tracking-wider mb-2">Status</div>
+                      <div className="md:hidden text-[10px] font-bold text-gray-500 uppercase tracking-wider mb-2"><T>Status</T></div>
                       <select
                         value={issue.status}
                         onChange={(e) =>
@@ -963,7 +1036,7 @@ export default function StaffReportsList({
                     {/* Upvote count */}
                     <td className="px-0 py-3 md:px-4 md:py-2.5 whitespace-nowrap block md:table-cell border-b border-gray-100 dark:border-gray-800 md:border-0">
                       <div className="flex items-center justify-between md:justify-center">
-                        <span className="md:hidden text-[10px] font-bold text-gray-500 uppercase tracking-wider">Upvotes</span>
+                        <span className="md:hidden text-[10px] font-bold text-gray-500 uppercase tracking-wider"><T>Upvotes</T></span>
                         <div className="inline-flex items-center justify-center min-w-[44px] min-h-[44px] md:min-h-[auto] md:min-w-[auto] gap-1.5 px-2 py-1 rounded bg-[#EFF6FF] border border-[#BFDBFE] text-blue-700 font-bold">
                           <span>{issue.upvotesCount || 0}</span>
                         </div>
@@ -973,7 +1046,7 @@ export default function StaffReportsList({
                     {/* Deletion / Action button */}
                     <td className="px-0 py-2.5 md:px-4 md:py-2.5 whitespace-nowrap block md:table-cell">
                       <div className="flex items-center justify-between md:justify-end gap-1">
-                        <span className="md:hidden text-[10px] font-bold text-gray-500 uppercase tracking-wider">Actions</span>
+                        <span className="md:hidden text-[10px] font-bold text-gray-500 uppercase tracking-wider"><T>Actions</T></span>
                         <div className="flex items-center gap-1">
                           {/* RULE B — Official Staff Override */}
                           {canActOnIssue(scope, issue) &&
@@ -986,6 +1059,17 @@ export default function StaffReportsList({
                                 title="Corroborate & Approve (Staff Verified)"
                               >
                                 <ShieldCheck className="w-4 h-4" />
+                              </button>
+                            )}
+                          {canActOnIssue(scope, issue) &&
+                            (issue.status === "Resolved" ||
+                              (issue.escalationHistory?.length || 0) > 0) && (
+                              <button
+                                onClick={() => downloadResolutionPdf(issue)}
+                                className="min-h-[40px] min-w-[40px] flex items-center justify-center text-blue-600 hover:bg-blue-50 dark:hover:bg-blue-900/20 rounded-xl transition-all cursor-pointer"
+                                title="Download resolution report (PDF)"
+                              >
+                                <Download className="w-4 h-4" />
                               </button>
                             )}
                           <button
@@ -1016,7 +1100,7 @@ export default function StaffReportsList({
                 <Trash2 className="w-6 h-6" />
               </div>
               <h3 className="text-lg font-semibold text-[#1A1A1A] dark:text-white">
-                Delete Civic Report?
+                <T>Delete Civic Report?</T>
               </h3>
               <p className="text-xs text-[#717171] dark:text-gray-400 leading-relaxed">
                 Are you sure you want to delete this report from the list? This
@@ -1028,13 +1112,13 @@ export default function StaffReportsList({
                 onClick={() => setDeleteTargetId(null)}
                 className="flex-1 py-2.5 rounded-full border border-[#E5E5E5] dark:border-gray-700 text-xs font-bold hover:bg-[#F9FAFB] dark:hover:bg-gray-800 text-gray-900 dark:text-white transition-colors cursor-pointer"
               >
-                Cancel
+                <T>Cancel</T>
               </button>
               <button
                 onClick={handleConfirmDeleteReport}
                 className="flex-1 py-2.5 rounded-full bg-red-600 hover:bg-red-700 text-white text-xs font-bold transition-colors cursor-pointer"
               >
-                Yes, Delete
+                <T>Yes, Delete</T>
               </button>
             </div>
           </div>
@@ -1050,7 +1134,7 @@ export default function StaffReportsList({
                 <AlertTriangle className="w-6 h-6" />
               </div>
               <h3 className="text-lg font-semibold text-[#1A1A1A] dark:text-white">
-                Purge All Civic Reports?
+                <T>Purge All Civic Reports?</T>
               </h3>
               <p className="text-xs text-red-600 dark:text-red-400 font-semibold bg-red-50 dark:bg-red-900/20 p-2.5 rounded-xl border border-red-100 dark:border-red-900/50">
                 CRITICAL WARNING: This action permanently purges ALL municipal
@@ -1066,13 +1150,13 @@ export default function StaffReportsList({
                 onClick={() => setShowPurgeModal(false)}
                 className="flex-1 py-3 rounded-full border border-[#E5E5E5] dark:border-gray-700 text-xs font-bold hover:bg-[#F9FAFB] dark:hover:bg-gray-800 text-gray-900 dark:text-white transition-colors cursor-pointer"
               >
-                Cancel
+                <T>Cancel</T>
               </button>
               <button
                 onClick={handleConfirmPurgeAllReports}
                 className="flex-1 py-3 rounded-full bg-red-600 hover:bg-red-700 text-white text-xs font-bold transition-colors cursor-pointer"
               >
-                Reset Ledger
+                <T>Reset Ledger</T>
               </button>
             </div>
           </div>
